@@ -1,0 +1,60 @@
+diff --git a/cast/standalone_receiver/BUILD.gn b/cast/standalone_receiver/BUILD.gn
+index 5a7be769..1f81e47f 100644
+--- a/cast/standalone_receiver/BUILD.gn
++++ b/cast/standalone_receiver/BUILD.gn
+@@ -70,6 +70,14 @@ openscreen_executable("cast_receiver") {
+   sources = [ "main.cc" ]
+ 
+   frameworks = [
++    "Cocoa.framework",
++    "Carbon.framework",
++    "UniformTypeIdentifiers.framework",
++    "Foundation.framework",
++    "CoreVideo.framework",
++    "CoreAudio.framework",
++    "QuartzCore.framework",
++    "Metal.framework",
+     "AudioToolbox.framework",
+     "CoreFoundation.framework",
+     "CoreMedia.framework",
+@@ -79,6 +87,10 @@ openscreen_executable("cast_receiver") {
+ 
+   libs = [
+     "z",
++    "aom",
++    "opus",
++    "vpx",
++    "SDL3",
+   ]
+ 
+   deps = [
+diff --git a/cast/standalone_sender/BUILD.gn b/cast/standalone_sender/BUILD.gn
+index 7b8e5549..5ee21736 100644
+--- a/cast/standalone_sender/BUILD.gn
++++ b/cast/standalone_sender/BUILD.gn
+@@ -47,6 +47,14 @@ if (!build_with_chromium) {
+     include_dirs = []
+     lib_dirs = []
+     frameworks = [
++        "Cocoa.framework",
++        "Carbon.framework",
++        "UniformTypeIdentifiers.framework",
++        "Foundation.framework",
++        "CoreVideo.framework",
++        "CoreAudio.framework",
++        "QuartzCore.framework",
++        "Metal.framework",
+         "AudioToolbox.framework",
+         "CoreFoundation.framework",
+         "CoreMedia.framework",
+@@ -56,6 +64,10 @@ if (!build_with_chromium) {
+ 
+     libs = [
+         "z",
++        "aom",
++        "opus",
++        "vpx",
++        "SDL3",
+     ]
+ 
+     if (have_external_libs) {
