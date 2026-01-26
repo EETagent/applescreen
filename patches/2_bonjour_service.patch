@@ -1,0 +1,577 @@
+diff --git a/discovery/BUILD.gn b/discovery/BUILD.gn
+index 256e81af..1010b3f2 100644
+--- a/discovery/BUILD.gn
++++ b/discovery/BUILD.gn
+@@ -92,6 +92,10 @@ openscreen_source_set("dnssd") {
+   ]
+   public = []
+   sources = [
++    "dnssd/impl/bonjour_publisher_impl.cc",
++    "dnssd/impl/bonjour_publisher_impl.h",
++    "dnssd/impl/bonjour_service_dispatcher.cc",
++    "dnssd/impl/bonjour_service_dispatcher.h",
+     "dnssd/impl/conversion_layer.cc",
+     "dnssd/impl/conversion_layer.h",
+     "dnssd/impl/dns_data_graph.cc",
+@@ -112,6 +116,8 @@ openscreen_source_set("dnssd") {
+     "dnssd/impl/service_key.h",
+   ]
+ 
++  frameworks = [ "CoreServices.framework" ]
++
+   deps = [
+     ":mdns",
+     ":public",
+diff --git a/discovery/dnssd/impl/DEPS b/discovery/dnssd/impl/DEPS
+index 2ac6f314..a0fb6613 100644
+--- a/discovery/dnssd/impl/DEPS
++++ b/discovery/dnssd/impl/DEPS
+@@ -5,4 +5,8 @@ include_rules = [
+   '+discovery/mdns/public',
+   '+discovery/mdns/testing/mdns_test_util.h',
+   '+discovery/public',
++  '+discovery/common',
++  '+platform/api',
++  '+platform/base',
++  '+util',
+ ]
+diff --git a/discovery/dnssd/impl/bonjour_publisher_impl.cc b/discovery/dnssd/impl/bonjour_publisher_impl.cc
+new file mode 100644
+index 00000000..7575a273
+--- /dev/null
++++ b/discovery/dnssd/impl/bonjour_publisher_impl.cc
+@@ -0,0 +1,353 @@
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "discovery/dnssd/impl/bonjour_publisher_impl.h"
++
++#include <arpa/inet.h>
++#include <sys/select.h>
++
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "discovery/common/reporting_client.h"
++#include "platform/api/task_runner.h"
++#include "util/osp_logging.h"
++
++namespace openscreen::discovery {
++namespace {
++
++DNSServiceErrorType ToTxtRecord(const DnsSdTxtRecord& txt,
++                                TXTRecordRef* txt_record) {
++  TXTRecordCreate(txt_record, 0, nullptr);
++  for (const auto& entry : txt.GetData()) {
++    if (entry.empty()) {
++      continue;
++    }
++
++    std::string entry_string(entry.begin(), entry.end());
++    const size_t equals = entry_string.find('=');
++    std::string key;
++    const uint8_t* value_ptr = nullptr;
++    uint8_t value_size = 0;
++    if (equals == std::string::npos) {
++      key = std::move(entry_string);
++    } else {
++      key = entry_string.substr(0, equals);
++      const std::string value = entry_string.substr(equals + 1);
++      value_ptr = reinterpret_cast<const uint8_t*>(value.data());
++      value_size = static_cast<uint8_t>(value.size());
++    }
++
++    if (key.empty()) {
++      continue;
++    }
++
++    const DNSServiceErrorType result =
++        TXTRecordSetValue(txt_record, key.c_str(), value_size, value_ptr);
++    if (result != kDNSServiceErr_NoError) {
++      TXTRecordDeallocate(txt_record);
++      return result;
++    }
++  }
++
++  return kDNSServiceErr_NoError;
++}
++
++Error ConvertServiceError(DNSServiceErrorType error) {
++  if (error == kDNSServiceErr_NoError) {
++    return Error::None();
++  }
++  if (error == kDNSServiceErr_NameConflict) {
++    return Error::Code::kItemAlreadyExists;
++  }
++  return Error(Error::Code::kMdnsRegisterFailure,
++               "Bonjour registration failed");
++}
++
++Error ConvertUpdateError(DNSServiceErrorType error) {
++  if (error == kDNSServiceErr_NoError) {
++    return Error::None();
++  }
++  return Error(Error::Code::kMdnsRegisterFailure, "Bonjour update failed");
++}
++
++}  // namespace
++
++struct BonjourPublisherImpl::Registration {
++  DnsSdInstance instance;
++  InterfaceInfo interface;
++  Client* client = nullptr;
++  DNSServiceRef service_ref = nullptr;
++  std::thread service_thread;
++  std::atomic_bool stop_requested = false;
++  BonjourPublisherImpl* owner = nullptr;
++
++  Registration(DnsSdInstance instance_in,
++               InterfaceInfo interface_in,
++               Client* client_in,
++               BonjourPublisherImpl* owner_in)
++      : instance(std::move(instance_in)),
++        interface(std::move(interface_in)),
++        client(client_in),
++        owner(owner_in) {}
++};
++
++BonjourPublisherImpl::BonjourPublisherImpl(
++    TaskRunner& task_runner,
++    ReportingClient& reporting_client,
++    std::vector<InterfaceInfo> interfaces)
++    : task_runner_(task_runner),
++      reporting_client_(reporting_client),
++      interfaces_(std::move(interfaces)) {}
++
++BonjourPublisherImpl::~BonjourPublisherImpl() {
++  for (auto& registration : registrations_) {
++    StopRegistration(*registration);
++  }
++}
++
++Error BonjourPublisherImpl::Register(const DnsSdInstance& instance,
++                                     Client* client) {
++  OSP_CHECK(client);
++  for (const auto& interface : interfaces_) {
++    Error result = RegisterOnInterface(instance, client, interface);
++    if (!result.ok()) {
++      return result;
++    }
++  }
++
++  return Error::None();
++}
++
++Error BonjourPublisherImpl::UpdateRegistration(const DnsSdInstance& instance) {
++  bool updated = false;
++  Error result = Error::None();
++  for (auto& registration : registrations_) {
++    if (registration->instance.instance_id() != instance.instance_id() ||
++        registration->instance.service_id() != instance.service_id() ||
++        registration->instance.domain_id() != instance.domain_id()) {
++      continue;
++    }
++    updated = true;
++    Error update_result = UpdateRegistrationInternal(*registration, instance);
++    if (!update_result.ok()) {
++      result = update_result;
++    }
++  }
++
++  if (!updated) {
++    return Error::Code::kParameterInvalid;
++  }
++
++  return result;
++}
++
++ErrorOr<int> BonjourPublisherImpl::DeregisterAll(const std::string& service) {
++  int removed = 0;
++  for (auto it = registrations_.begin(); it != registrations_.end();) {
++    if ((*it)->instance.service_id() == service) {
++      StopRegistration(*(*it));
++      it = registrations_.erase(it);
++      removed++;
++    } else {
++      ++it;
++    }
++  }
++
++  return removed;
++}
++
++Error BonjourPublisherImpl::RegisterOnInterface(const DnsSdInstance& instance,
++                                                Client* client,
++                                                const InterfaceInfo& interface) {
++  if (!interface.GetIpAddressV4() && !interface.GetIpAddressV6()) {
++    return Error::None();
++  }
++  auto registration = std::make_unique<Registration>(instance,
++                                                     interface,
++                                                     client,
++                                                     this);
++
++  TXTRecordRef txt_record;
++  const DNSServiceErrorType txt_result = ToTxtRecord(instance.txt(), &txt_record);
++  if (txt_result != kDNSServiceErr_NoError) {
++    return ConvertServiceError(txt_result);
++  }
++
++  DNSServiceRef service_ref = nullptr;
++  const DNSServiceErrorType result = DNSServiceRegister(
++      &service_ref,
++      0,
++      static_cast<uint32_t>(interface.index),
++      instance.instance_id().c_str(),
++      instance.service_id().c_str(),
++      instance.domain_id().c_str(),
++      nullptr,
++      htons(instance.port()),
++      TXTRecordGetLength(&txt_record),
++      TXTRecordGetBytesPtr(&txt_record),
++      &BonjourPublisherImpl::OnServiceRegistered,
++      registration.get());
++
++  TXTRecordDeallocate(&txt_record);
++  if (result != kDNSServiceErr_NoError) {
++    return ConvertServiceError(result);
++  }
++
++  registration->service_ref = service_ref;
++  registrations_.push_back(std::move(registration));
++  StartServiceThread(*registrations_.back());
++  return Error::None();
++}
++
++Error BonjourPublisherImpl::UpdateRegistrationInternal(
++    Registration& registration,
++    const DnsSdInstance& instance) {
++  TXTRecordRef txt_record;
++  const DNSServiceErrorType txt_result = ToTxtRecord(instance.txt(), &txt_record);
++  if (txt_result != kDNSServiceErr_NoError) {
++    return ConvertUpdateError(txt_result);
++  }
++
++  const DNSServiceErrorType update_result = DNSServiceUpdateRecord(
++      registration.service_ref,
++      nullptr,
++      0,
++      TXTRecordGetLength(&txt_record),
++      TXTRecordGetBytesPtr(&txt_record),
++      0);
++
++  TXTRecordDeallocate(&txt_record);
++  if (update_result != kDNSServiceErr_NoError) {
++    return ConvertUpdateError(update_result);
++  }
++
++  registration.instance = instance;
++  return Error::None();
++}
++
++void BonjourPublisherImpl::StopRegistration(Registration& registration) {
++  registration.stop_requested.store(true, std::memory_order_relaxed);
++  if (registration.service_thread.joinable()) {
++    registration.service_thread.join();
++  }
++  if (registration.service_ref) {
++    DNSServiceRefDeallocate(registration.service_ref);
++    registration.service_ref = nullptr;
++  }
++}
++
++void BonjourPublisherImpl::StartServiceThread(Registration& registration) {
++  registration.service_thread = std::thread([&registration] {
++    const int fd = DNSServiceRefSockFD(registration.service_ref);
++    if (fd < 0) {
++      return;
++    }
++
++    while (!registration.stop_requested.load(std::memory_order_relaxed)) {
++      fd_set read_fds;
++      FD_ZERO(&read_fds);
++      FD_SET(fd, &read_fds);
++      timeval timeout{1, 0};
++      const int result = select(fd + 1, &read_fds, nullptr, nullptr, &timeout);
++      if (result > 0 && FD_ISSET(fd, &read_fds)) {
++        DNSServiceProcessResult(registration.service_ref);
++      }
++    }
++  });
++}
++
++void BonjourPublisherImpl::HandleServiceRegistered(
++    Registration* registration,
++    const char* name,
++    const char* regtype,
++    const char* domain,
++    DNSServiceErrorType error) {
++  if (!registration) {
++    return;
++  }
++  DnsSdInstance instance = registration->instance;
++  InterfaceInfo interface = registration->interface;
++  Client* client = registration->client;
++  task_runner_.PostTask([this,
++                         instance = std::move(instance),
++                         interface = std::move(interface),
++                         client,
++                         error,
++                         name = std::string(name ? name : ""),
++                         regtype = std::string(regtype ? regtype : ""),
++                         domain = std::string(domain ? domain : "")] {
++    if (error != kDNSServiceErr_NoError) {
++      reporting_client_.OnRecoverableError(
++          Error(Error::Code::kMdnsRegisterFailure,
++                "Bonjour registration callback error"));
++      return;
++    }
++
++    if (!interface.GetIpAddressV4() && !interface.GetIpAddressV6()) {
++      reporting_client_.OnRecoverableError(
++          Error(Error::Code::kMdnsRegisterFailure,
++                "Bonjour registration missing interface address"));
++      return;
++    }
++
++    DnsSdInstanceEndpoint endpoint =
++        BuildEndpoint(instance, interface,
++                      name.empty() ? nullptr : name.c_str());
++    if (client) {
++      client->OnEndpointClaimed(instance, endpoint);
++    }
++    (void)regtype;
++    (void)domain;
++  });
++}
++
++DnsSdInstanceEndpoint BonjourPublisherImpl::BuildEndpoint(
++    const DnsSdInstance& instance,
++    const InterfaceInfo& interface,
++    const char* claimed_name) const {
++  const std::string instance_id =
++      claimed_name && claimed_name[0] ? claimed_name : instance.instance_id();
++  std::vector<IPEndpoint> endpoints;
++  if (interface.GetIpAddressV4()) {
++    endpoints.push_back({interface.GetIpAddressV4(), instance.port()});
++  }
++  if (interface.GetIpAddressV6()) {
++    endpoints.push_back({interface.GetIpAddressV6(), instance.port()});
++  }
++
++  if (endpoints.empty()) {
++    endpoints.push_back({IPAddress::kAnyV4(), instance.port()});
++  }
++
++  return DnsSdInstanceEndpoint(instance_id,
++                               instance.service_id(),
++                               instance.domain_id(),
++                               instance.txt(),
++                               interface.index,
++                               std::move(endpoints));
++}
++
++void BonjourPublisherImpl::OnServiceRegistered(DNSServiceRef service_ref,
++                                               DNSServiceFlags flags,
++                                               DNSServiceErrorType error,
++                                               const char* name,
++                                               const char* regtype,
++                                               const char* domain,
++                                               void* context) {
++  (void)service_ref;
++  (void)flags;
++  auto* registration = static_cast<Registration*>(context);
++  if (!registration || !registration->owner) {
++    return;
++  }
++
++  registration->owner->HandleServiceRegistered(registration,
++                                                name,
++                                                regtype,
++                                                domain,
++                                                error);
++}
++
++}  // namespace openscreen::discovery
+diff --git a/discovery/dnssd/impl/bonjour_publisher_impl.h b/discovery/dnssd/impl/bonjour_publisher_impl.h
+new file mode 100644
+index 00000000..89f321e9
+--- /dev/null
++++ b/discovery/dnssd/impl/bonjour_publisher_impl.h
+@@ -0,0 +1,76 @@
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef DISCOVERY_DNSSD_IMPL_BONJOUR_PUBLISHER_IMPL_H_
++#define DISCOVERY_DNSSD_IMPL_BONJOUR_PUBLISHER_IMPL_H_
++
++#include <dns_sd.h>
++
++#include <atomic>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "discovery/dnssd/public/dns_sd_instance.h"
++#include "discovery/dnssd/public/dns_sd_instance_endpoint.h"
++#include "discovery/dnssd/public/dns_sd_publisher.h"
++#include "platform/base/error.h"
++#include "platform/base/interface_info.h"
++
++namespace openscreen {
++
++class TaskRunner;
++
++namespace discovery {
++
++class ReportingClient;
++
++class BonjourPublisherImpl final : public DnsSdPublisher {
++ public:
++  BonjourPublisherImpl(TaskRunner& task_runner,
++                       ReportingClient& reporting_client,
++                       std::vector<InterfaceInfo> interfaces);
++  ~BonjourPublisherImpl() override;
++
++  Error Register(const DnsSdInstance& instance, Client* client) override;
++  Error UpdateRegistration(const DnsSdInstance& instance) override;
++  ErrorOr<int> DeregisterAll(const std::string& service) override;
++
++ private:
++  struct Registration;
++
++  Error RegisterOnInterface(const DnsSdInstance& instance,
++                            Client* client,
++                            const InterfaceInfo& interface);
++  Error UpdateRegistrationInternal(Registration& registration,
++                                   const DnsSdInstance& instance);
++  void StopRegistration(Registration& registration);
++  void StartServiceThread(Registration& registration);
++  void HandleServiceRegistered(Registration* registration,
++                               const char* name,
++                               const char* regtype,
++                               const char* domain,
++                               DNSServiceErrorType error);
++  DnsSdInstanceEndpoint BuildEndpoint(const DnsSdInstance& instance,
++                                      const InterfaceInfo& interface,
++                                      const char* claimed_name) const;
++
++  static void DNSSD_API OnServiceRegistered(DNSServiceRef service_ref,
++                                            DNSServiceFlags flags,
++                                            DNSServiceErrorType error,
++                                            const char* name,
++                                            const char* regtype,
++                                            const char* domain,
++                                            void* context);
++
++  TaskRunner& task_runner_;
++  ReportingClient& reporting_client_;
++  std::vector<InterfaceInfo> interfaces_;
++  std::vector<std::unique_ptr<Registration>> registrations_;
++};
++
++}  // namespace discovery
++}  // namespace openscreen
++
++#endif  // DISCOVERY_DNSSD_IMPL_BONJOUR_PUBLISHER_IMPL_H_
+diff --git a/discovery/dnssd/impl/bonjour_service_dispatcher.cc b/discovery/dnssd/impl/bonjour_service_dispatcher.cc
+new file mode 100644
+index 00000000..a26ab78a
+--- /dev/null
++++ b/discovery/dnssd/impl/bonjour_service_dispatcher.cc
+@@ -0,0 +1,26 @@
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "discovery/dnssd/impl/bonjour_service_dispatcher.h"
++
++#include "discovery/common/config.h"
++#include "discovery/common/reporting_client.h"
++#include "discovery/dnssd/impl/bonjour_publisher_impl.h"
++#include "platform/api/task_runner.h"
++
++namespace openscreen::discovery {
++
++BonjourServiceDispatcher::BonjourServiceDispatcher(
++    TaskRunner& task_runner,
++    ReportingClient& reporting_client,
++    const Config& config)
++    : publisher_(config.enable_publication
++                     ? std::make_unique<BonjourPublisherImpl>(
++                           task_runner,
++                           reporting_client,
++                           config.network_info)
++                     : nullptr) {}
++
++BonjourServiceDispatcher::~BonjourServiceDispatcher() = default;
++
++}  // namespace openscreen::discovery
+diff --git a/discovery/dnssd/impl/bonjour_service_dispatcher.h b/discovery/dnssd/impl/bonjour_service_dispatcher.h
+new file mode 100644
+index 00000000..c8f31694
+--- /dev/null
++++ b/discovery/dnssd/impl/bonjour_service_dispatcher.h
+@@ -0,0 +1,40 @@
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef DISCOVERY_DNSSD_IMPL_BONJOUR_SERVICE_DISPATCHER_H_
++#define DISCOVERY_DNSSD_IMPL_BONJOUR_SERVICE_DISPATCHER_H_
++
++#include <memory>
++
++#include "discovery/dnssd/impl/bonjour_publisher_impl.h"
++#include "discovery/dnssd/public/dns_sd_publisher.h"
++#include "discovery/dnssd/public/dns_sd_querier.h"
++#include "discovery/dnssd/public/dns_sd_service.h"
++
++namespace openscreen {
++
++class TaskRunner;
++
++namespace discovery {
++
++struct Config;
++class ReportingClient;
++
++class BonjourServiceDispatcher final : public DnsSdService {
++ public:
++  BonjourServiceDispatcher(TaskRunner& task_runner,
++                           ReportingClient& reporting_client,
++                           const Config& config);
++  ~BonjourServiceDispatcher() override;
++
++  DnsSdQuerier* GetQuerier() override { return nullptr; }
++  DnsSdPublisher* GetPublisher() override { return publisher_.get(); }
++
++ private:
++  std::unique_ptr<BonjourPublisherImpl> publisher_;
++};
++
++}  // namespace discovery
++}  // namespace openscreen
++
++#endif  // DISCOVERY_DNSSD_IMPL_BONJOUR_SERVICE_DISPATCHER_H_
+diff --git a/discovery/dnssd/impl/service_dispatcher.cc b/discovery/dnssd/impl/service_dispatcher.cc
+index da3b96e5..1efdf39c 100644
+--- a/discovery/dnssd/impl/service_dispatcher.cc
++++ b/discovery/dnssd/impl/service_dispatcher.cc
+@@ -7,6 +7,7 @@
+ #include <utility>
+ 
+ #include "discovery/common/config.h"
++#include "discovery/dnssd/impl/bonjour_service_dispatcher.h"
+ #include "discovery/dnssd/impl/service_instance.h"
+ #include "discovery/dnssd/public/dns_sd_instance.h"
+ #include "discovery/mdns/public/mdns_service.h"
+@@ -54,7 +55,7 @@ Error ForAllPublishers(
+ DnsSdServicePtr CreateDnsSdService(TaskRunner& task_runner,
+                                    ReportingClient& reporting_client,
+                                    const Config& config) {
+-  return TaskRunnerDeleter::MakeUnique<ServiceDispatcher>(
++  return TaskRunnerDeleter::MakeUnique<BonjourServiceDispatcher>(
+       task_runner, task_runner, reporting_client, config);
+ }
+ 

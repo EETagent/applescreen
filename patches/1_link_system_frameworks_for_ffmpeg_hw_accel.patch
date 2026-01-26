@@ -1,0 +1,47 @@
+diff --git a/cast/standalone_receiver/BUILD.gn b/cast/standalone_receiver/BUILD.gn
+index 7c281b75..479b1065 100644
+--- a/cast/standalone_receiver/BUILD.gn
++++ b/cast/standalone_receiver/BUILD.gn
+@@ -69,6 +69,18 @@ openscreen_executable("cast_receiver") {
+   visibility += [ "../..:gn_all" ]
+   sources = [ "main.cc" ]
+ 
++  frameworks = [
++    "AudioToolbox.framework",
++    "CoreFoundation.framework",
++    "CoreMedia.framework",
++    "VideoToolbox.framework",
++    "CoreVideo.framework",
++  ]
++
++  libs = [
++    "z",
++  ]
++
+   deps = [
+     ":cast_receiver_lib",
+     "../../platform:standalone_impl",
+diff --git a/cast/standalone_sender/BUILD.gn b/cast/standalone_sender/BUILD.gn
+index 362e0029..7b8e5549 100644
+--- a/cast/standalone_sender/BUILD.gn
++++ b/cast/standalone_sender/BUILD.gn
+@@ -46,7 +46,18 @@ if (!build_with_chromium) {
+     sources = [ "main.cc" ]
+     include_dirs = []
+     lib_dirs = []
+-    libs = []
++    frameworks = [
++        "AudioToolbox.framework",
++        "CoreFoundation.framework",
++        "CoreMedia.framework",
++        "VideoToolbox.framework",
++        "CoreVideo.framework",
++    ]
++
++    libs = [
++        "z",
++    ]
++
+     if (have_external_libs) {
+       sources += [
+         "connection_settings.h",

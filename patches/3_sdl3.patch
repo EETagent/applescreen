@@ -1,0 +1,490 @@
+diff --git a/cast/standalone_receiver/BUILD.gn b/cast/standalone_receiver/BUILD.gn
+index 479b1065..5a7be769 100644
+--- a/cast/standalone_receiver/BUILD.gn
++++ b/cast/standalone_receiver/BUILD.gn
+@@ -38,7 +38,7 @@ openscreen_source_set("cast_receiver_lib") {
+     "../streaming:receiver",
+   ]
+ 
+-  if (have_ffmpeg && have_libsdl2) {
++  if (have_ffmpeg && have_libsdl3) {
+     defines = [ "CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS" ]
+     sources += [
+       "avcodec_glue.h",
+@@ -53,9 +53,9 @@ openscreen_source_set("cast_receiver_lib") {
+       "sdl_video_player.cc",
+       "sdl_video_player.h",
+     ]
+-    include_dirs = ffmpeg_include_dirs + libsdl2_include_dirs
+-    lib_dirs = external_lib_dirs + ffmpeg_lib_dirs + libsdl2_lib_dirs
+-    libs = ffmpeg_libs + libsdl2_libs
++    include_dirs = ffmpeg_include_dirs + libsdl3_include_dirs
++    lib_dirs = external_lib_dirs + ffmpeg_lib_dirs + libsdl3_lib_dirs
++    libs = ffmpeg_libs + libsdl3_libs
+   } else {
+     sources += [
+       "dummy_player.cc",
+diff --git a/cast/standalone_receiver/sdl_audio_player.cc b/cast/standalone_receiver/sdl_audio_player.cc
+index d056adb0..36697ddb 100644
+--- a/cast/standalone_receiver/sdl_audio_player.cc
++++ b/cast/standalone_receiver/sdl_audio_player.cc
+@@ -21,11 +21,11 @@ namespace openscreen::cast {
+ namespace {
+ 
+ constexpr char kAudioMediaType[] = "audio";
+-constexpr SDL_AudioFormat kSDLAudioFormatUnknown = 0;
++constexpr SDL_AudioFormat kSDLAudioFormatUnknown =
++    static_cast<SDL_AudioFormat>(0);
+ 
+ bool SDLAudioSpecsAreDifferent(const SDL_AudioSpec& a, const SDL_AudioSpec& b) {
+-  return a.freq != b.freq || a.format != b.format || a.channels != b.channels ||
+-         a.samples != b.samples;
++  return a.freq != b.freq || a.format != b.format || a.channels != b.channels;
+ }
+ 
+ // Convert `num_channels` separate `planes` of audio, each containing
+@@ -65,7 +65,11 @@ SDLAudioPlayer::SDLAudioPlayer(ClockNowFunctionPtr now_function,
+                     kAudioMediaType) {}
+ 
+ SDLAudioPlayer::~SDLAudioPlayer() {
+-  if (device_ > 0) {
++  if (audio_stream_) {
++    SDL_DestroyAudioStream(audio_stream_);
++    audio_stream_ = nullptr;
++    device_ = 0;
++  } else if (device_ > 0) {
+     SDL_CloseAudioDevice(device_);
+   }
+ }
+@@ -106,25 +110,12 @@ ErrorOr<Clock::time_point> SDLAudioPlayer::RenderNextFrame(
+   }
+   pending_audio_spec_.channels = frame_channels;
+ 
+-  // If `device_spec_` is different from what is required, re-compute the sample
+-  // buffer size and the amount of time that represents. The `device_spec_` will
+-  // be updated to match `pending_audio_spec_` later, in Present().
++  // If `device_spec_` is different from what is required, pick a conservative
++  // lead time based on the desired format. The `device_spec_` will be updated
++  // to match `pending_audio_spec_` later, in Present().
+   if (SDLAudioSpecsAreDifferent(device_spec_, pending_audio_spec_)) {
+-    // Find the smallest power-of-two number of samples that represents at least
+-    // 20ms of audio.
+     constexpr auto kMinBufferDuration = milliseconds(20);
+-    constexpr auto kOneSecond = seconds(1);
+-    const auto required_samples = static_cast<int>(
+-        pending_audio_spec_.freq * kMinBufferDuration / kOneSecond);
+-    OSP_CHECK_GE(required_samples, 1);
+-    pending_audio_spec_.samples = 1 << av_log2(required_samples);
+-    if (pending_audio_spec_.samples < required_samples) {
+-      pending_audio_spec_.samples *= 2;
+-    }
+-
+-    approximate_lead_time_ =
+-        (pending_audio_spec_.samples * Clock::to_duration(kOneSecond)) /
+-        pending_audio_spec_.freq;
++    approximate_lead_time_ = kMinBufferDuration;
+   }
+ 
+   // If the decoded audio is in planar format, interleave it for SDL.
+@@ -183,30 +174,61 @@ void SDLAudioPlayer::Present() {
+ 
+   // Re-open audio device, if the audio format has changed.
+   if (SDLAudioSpecsAreDifferent(pending_audio_spec_, device_spec_)) {
+-    if (device_ > 0) {
+-      SDL_CloseAudioDevice(device_);
++    if (audio_stream_) {
++      SDL_DestroyAudioStream(audio_stream_);
++      audio_stream_ = nullptr;
++      device_ = 0;
+       device_spec_ = SDL_AudioSpec{};
+     }
+ 
+-    device_ = SDL_OpenAudioDevice(nullptr,  // Pick default device.
+-                                  0,        // For playback, not recording.
+-                                  &pending_audio_spec_,  // Desired format.
+-                                  &device_spec_,  // [output] Obtained format.
+-                                  0  // Disallow formats other than desired.
+-    );
++    SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(
++        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
++        &pending_audio_spec_,
++        nullptr,
++        nullptr);
++    if (!stream) {
++      std::ostringstream error;
++      error << "SDL_OpenAudioDeviceStream failed: " << SDL_GetError();
++      OnFatalError(error.str());
++      return;
++    }
++
++    device_ = SDL_GetAudioStreamDevice(stream);
+     if (device_ <= 0) {
+       std::ostringstream error;
+-      error << "SDL_OpenAudioDevice failed: " << SDL_GetError();
++      error << "SDL_GetAudioStreamDevice failed: " << SDL_GetError();
++      SDL_DestroyAudioStream(stream);
++      OnFatalError(error.str());
++      return;
++    }
++
++    int sample_frames = 0;
++    if (!SDL_GetAudioDeviceFormat(device_, &device_spec_, &sample_frames)) {
++      std::ostringstream error;
++      error << "SDL_GetAudioDeviceFormat failed: " << SDL_GetError();
++      SDL_DestroyAudioStream(stream);
+       OnFatalError(error.str());
+       return;
+     }
+     OSP_CHECK(!SDLAudioSpecsAreDifferent(pending_audio_spec_, device_spec_));
+ 
+-    constexpr int kSdlResumePlaybackCommand = 0;
+-    SDL_PauseAudioDevice(device_, kSdlResumePlaybackCommand);
++    if (!SDL_ResumeAudioStreamDevice(stream)) {
++      std::ostringstream error;
++      error << "SDL_ResumeAudioStreamDevice failed: " << SDL_GetError();
++      SDL_DestroyAudioStream(stream);
++      OnFatalError(error.str());
++      return;
++    }
++
++    audio_stream_ = stream;
+   }
+ 
+-  SDL_QueueAudio(device_, pending_audio_.data(), pending_audio_.size());
++  if (!SDL_PutAudioStreamData(audio_stream_, pending_audio_.data(),
++                              static_cast<int>(pending_audio_.size()))) {
++    std::ostringstream error;
++    error << "SDL_PutAudioStreamData failed: " << SDL_GetError();
++    OnFatalError(error.str());
++  }
+ }
+ 
+ // static
+@@ -214,19 +236,19 @@ SDL_AudioFormat SDLAudioPlayer::GetSDLAudioFormat(AVSampleFormat format) {
+   switch (format) {
+     case AV_SAMPLE_FMT_U8P:
+     case AV_SAMPLE_FMT_U8:
+-      return AUDIO_U8;
++      return SDL_AUDIO_U8;
+ 
+     case AV_SAMPLE_FMT_S16P:
+     case AV_SAMPLE_FMT_S16:
+-      return IsBigEndianArchitecture() ? AUDIO_S16MSB : AUDIO_S16LSB;
++      return IsBigEndianArchitecture() ? SDL_AUDIO_S16BE : SDL_AUDIO_S16LE;
+ 
+     case AV_SAMPLE_FMT_S32P:
+     case AV_SAMPLE_FMT_S32:
+-      return IsBigEndianArchitecture() ? AUDIO_S32MSB : AUDIO_S32LSB;
++      return IsBigEndianArchitecture() ? SDL_AUDIO_S32BE : SDL_AUDIO_S32LE;
+ 
+     case AV_SAMPLE_FMT_FLTP:
+     case AV_SAMPLE_FMT_FLT:
+-      return IsBigEndianArchitecture() ? AUDIO_F32MSB : AUDIO_F32LSB;
++      return IsBigEndianArchitecture() ? SDL_AUDIO_F32BE : SDL_AUDIO_F32LE;
+ 
+     default:
+       // Either NONE, or the 64-bit formats are unsupported.
+diff --git a/cast/standalone_receiver/sdl_audio_player.h b/cast/standalone_receiver/sdl_audio_player.h
+index 12d2c010..ed8ca87b 100644
+--- a/cast/standalone_receiver/sdl_audio_player.h
++++ b/cast/standalone_receiver/sdl_audio_player.h
+@@ -55,6 +55,9 @@ class SDLAudioPlayer final : public SDLPlayerBase {
+ 
+   // The audio format being used by the currently-open SDL audio device.
+   SDL_AudioSpec device_spec_{};
++
++  // SDL audio stream bound to the device.
++  SDL_AudioStream* audio_stream_ = nullptr;
+ };
+ 
+ }  // namespace openscreen::cast
+diff --git a/cast/standalone_receiver/sdl_glue.cc b/cast/standalone_receiver/sdl_glue.cc
+index ef622bcc..631d4876 100644
+--- a/cast/standalone_receiver/sdl_glue.cc
++++ b/cast/standalone_receiver/sdl_glue.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "cast/standalone_receiver/sdl_glue.h"
+ 
++#include <cstddef>
+ #include <utility>
+ 
+ #include "platform/api/task_runner.h"
+@@ -31,12 +32,12 @@ void SDLEventLoopProcessor::ProcessPendingEvents() {
+   // Process all pending events.
+   SDL_Event event;
+   while (SDL_PollEvent(&event)) {
+-    if (event.type == SDL_QUIT) {
++    if (event.type == SDL_EVENT_QUIT) {
+       OSP_VLOG << "SDL_QUIT received, invoking quit callback...";
+       if (quit_callback_) {
+         quit_callback_();
+       }
+-    } else if (event.type == SDL_KEYUP) {
++    } else if (event.type == SDL_EVENT_KEY_UP) {
+       for (auto& cb : keyboard_callbacks_) {
+         cb(event.key);
+       }
+diff --git a/cast/standalone_receiver/sdl_glue.h b/cast/standalone_receiver/sdl_glue.h
+index 3e7f5357..58d86f71 100644
+--- a/cast/standalone_receiver/sdl_glue.h
++++ b/cast/standalone_receiver/sdl_glue.h
+@@ -9,7 +9,7 @@
+ 
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+-#include <SDL2/SDL.h>
++#include <SDL3/SDL.h>
+ #pragma GCC diagnostic pop
+ 
+ #include <functional>
+@@ -28,7 +28,9 @@ namespace cast {
+ template <uint32_t subsystem>
+ class ScopedSDLSubSystem {
+  public:
+-  ScopedSDLSubSystem() { SDL_InitSubSystem(subsystem); }
++  ScopedSDLSubSystem() {
++    SDL_InitSubSystem(subsystem);
++  }
+   ~ScopedSDLSubSystem() { SDL_QuitSubSystem(subsystem); }
+ };
+ 
+@@ -36,27 +38,51 @@ class ScopedSDLSubSystem {
+ //
+ //  using SDLFooUniquePtr = std::unique_ptr<SDL_Foo, SDLFooDestroyer>;
+ //  SDLFooUniquePtr MakeUniqueSDLFoo(...args...);
+-#define DEFINE_SDL_UNIQUE_PTR(name)                          \
+-  struct SDL##name##Destroyer {                              \
+-    void operator()(SDL_##name* obj) const {                 \
+-      if (obj) {                                             \
+-        SDL_Destroy##name(obj);                              \
+-      }                                                      \
+-    }                                                        \
+-  };                                                         \
+-  using SDL##name##UniquePtr =                               \
+-      std::unique_ptr<SDL_##name, SDL##name##Destroyer>;     \
+-  template <typename... Args>                                \
+-  SDL##name##UniquePtr MakeUniqueSDL##name(Args&&... args) { \
+-    return SDL##name##UniquePtr(                             \
+-        SDL_Create##name(std::forward<Args>(args)...));      \
++struct SDLWindowDestroyer {
++  void operator()(SDL_Window* obj) const {
++    if (obj) {
++      SDL_DestroyWindow(obj);
++    }
+   }
+-
+-DEFINE_SDL_UNIQUE_PTR(Window)
+-DEFINE_SDL_UNIQUE_PTR(Renderer)
+-DEFINE_SDL_UNIQUE_PTR(Texture)
+-
+-#undef DEFINE_SDL_UNIQUE_PTR
++};
++using SDLWindowUniquePtr = std::unique_ptr<SDL_Window, SDLWindowDestroyer>;
++inline SDLWindowUniquePtr MakeUniqueSDLWindow(const char* title,
++                                              int width,
++                                              int height,
++                                              SDL_WindowFlags flags) {
++  return SDLWindowUniquePtr(SDL_CreateWindow(title, width, height, flags));
++}
++
++struct SDLRendererDestroyer {
++  void operator()(SDL_Renderer* obj) const {
++    if (obj) {
++      SDL_DestroyRenderer(obj);
++    }
++  }
++};
++using SDLRendererUniquePtr =
++    std::unique_ptr<SDL_Renderer, SDLRendererDestroyer>;
++inline SDLRendererUniquePtr MakeUniqueSDLRenderer(SDL_Window* window,
++                                                  const char* name) {
++  return SDLRendererUniquePtr(SDL_CreateRenderer(window, name));
++}
++
++struct SDLTextureDestroyer {
++  void operator()(SDL_Texture* obj) const {
++    if (obj) {
++      SDL_DestroyTexture(obj);
++    }
++  }
++};
++using SDLTextureUniquePtr = std::unique_ptr<SDL_Texture, SDLTextureDestroyer>;
++inline SDLTextureUniquePtr MakeUniqueSDLTexture(SDL_Renderer* renderer,
++                                                SDL_PixelFormat format,
++                                                SDL_TextureAccess access,
++                                                int width,
++                                                int height) {
++  return SDLTextureUniquePtr(
++      SDL_CreateTexture(renderer, format, access, width, height));
++}
+ 
+ // A looping mechanism that runs the SDL event loop by scheduling periodic tasks
+ // to the given TaskRunner. Looping continues indefinitely, until the instance
+diff --git a/cast/standalone_receiver/sdl_video_player.cc b/cast/standalone_receiver/sdl_video_player.cc
+index 600d227d..a4d048c6 100644
+--- a/cast/standalone_receiver/sdl_video_player.cc
++++ b/cast/standalone_receiver/sdl_video_player.cc
+@@ -82,7 +82,7 @@ ErrorOr<Clock::time_point> SDLVideoPlayer::RenderNextFrame(
+   const AVFrame& picture = *frame.decoded_frame;
+ 
+   // Punt if the `picture` format is not compatible with those supported by SDL.
+-  const uint32_t sdl_format = GetSDLPixelFormat(picture);
++  const SDL_PixelFormat sdl_format = GetSDLPixelFormat(picture);
+   if (sdl_format == SDL_PIXELFORMAT_UNKNOWN) {
+     std::ostringstream error;
+     error << "SDL does not support AVPixelFormat " << picture.format;
+@@ -92,14 +92,25 @@ ErrorOr<Clock::time_point> SDLVideoPlayer::RenderNextFrame(
+   // If there is already a SDL texture, check that its format and size matches
+   // that of `picture`. If not, release the existing texture.
+   if (texture_) {
+-    uint32_t texture_format = SDL_PIXELFORMAT_UNKNOWN;
+-    int texture_width = -1;
+-    int texture_height = -1;
+-    SDL_QueryTexture(texture_.get(), &texture_format, nullptr, &texture_width,
+-                     &texture_height);
+-    if (texture_format != sdl_format || texture_width != picture.width ||
+-        texture_height != picture.height) {
++    const SDL_PropertiesID texture_props =
++        SDL_GetTextureProperties(texture_.get());
++    if (texture_props == 0) {
+       texture_.reset();
++    } else {
++      const int texture_width = static_cast<int>(
++          SDL_GetNumberProperty(texture_props, SDL_PROP_TEXTURE_WIDTH_NUMBER,
++                                -1));
++      const int texture_height = static_cast<int>(
++          SDL_GetNumberProperty(texture_props, SDL_PROP_TEXTURE_HEIGHT_NUMBER,
++                                -1));
++      const SDL_PixelFormat texture_format =
++          static_cast<SDL_PixelFormat>(SDL_GetNumberProperty(
++              texture_props, SDL_PROP_TEXTURE_FORMAT_NUMBER,
++              SDL_PIXELFORMAT_UNKNOWN));
++      if (texture_format != sdl_format || texture_width != picture.width ||
++          texture_height != picture.height) {
++        texture_.reset();
++      }
+     }
+   }
+ 
+@@ -148,25 +159,38 @@ ErrorOr<Clock::time_point> SDLVideoPlayer::RenderNextFrame(
+   //    with the AVPicture might not match the assumptions being made within
+   //    SDL. Content may appear with washed-out colors, not-entirely-black
+   //    blacks, striped gradients, etc.
+-  const SDL_Rect src_rect = {
+-      static_cast<int>(picture.crop_left), static_cast<int>(picture.crop_top),
+-      picture.width - static_cast<int>(picture.crop_left + picture.crop_right),
+-      picture.height -
+-          static_cast<int>(picture.crop_top + picture.crop_bottom)};
+-  SDL_Rect dst_rect = {0, 0, 0, 0};
+-  SDL_RenderGetLogicalSize(&renderer_, &dst_rect.w, &dst_rect.h);
++  const SDL_FRect src_rect = {
++      static_cast<float>(picture.crop_left),
++      static_cast<float>(picture.crop_top),
++      static_cast<float>(picture.width -
++                         static_cast<int>(picture.crop_left +
++                                          picture.crop_right)),
++      static_cast<float>(picture.height -
++                         static_cast<int>(picture.crop_top +
++                                          picture.crop_bottom))};
++  int logical_width = 0;
++  int logical_height = 0;
++  SDL_RendererLogicalPresentation logical_mode =
++      SDL_LOGICAL_PRESENTATION_DISABLED;
++  SDL_GetRenderLogicalPresentation(&renderer_, &logical_width, &logical_height,
++                                   &logical_mode);
++  SDL_FRect dst_rect = {0.0f, 0.0f, static_cast<float>(logical_width),
++                        static_cast<float>(logical_height)};
+   if (src_rect.w != dst_rect.w || src_rect.h != dst_rect.h) {
+     // Make the SDL rendering size the same as the frame's visible size. This
+     // lets SDL automatically handle letterboxing and scaling details, so that
+     // the video fits within the on-screen window.
+     dst_rect.w = src_rect.w;
+     dst_rect.h = src_rect.h;
+-    SDL_RenderSetLogicalSize(&renderer_, dst_rect.w, dst_rect.h);
++    SDL_SetRenderLogicalPresentation(&renderer_,
++                                     static_cast<int>(dst_rect.w),
++                                     static_cast<int>(dst_rect.h),
++                                     SDL_LOGICAL_PRESENTATION_LETTERBOX);
+   }
+   // Clear with black, for the "letterboxing" borders.
+   SDL_SetRenderDrawColor(&renderer_, 0, 0, 0, 255);
+   SDL_RenderClear(&renderer_);
+-  SDL_RenderCopy(&renderer_, texture_.get(), &src_rect, &dst_rect);
++  SDL_RenderTexture(&renderer_, texture_.get(), &src_rect, &dst_rect);
+ 
+   return frame.presentation_time;
+ }
+@@ -177,7 +201,7 @@ void SDLVideoPlayer::Present() {
+ }
+ 
+ // static
+-uint32_t SDLVideoPlayer::GetSDLPixelFormat(const AVFrame& picture) {
++SDL_PixelFormat SDLVideoPlayer::GetSDLPixelFormat(const AVFrame& picture) {
+   switch (picture.format) {
+     case AV_PIX_FMT_NONE:
+       break;
+diff --git a/cast/standalone_receiver/sdl_video_player.h b/cast/standalone_receiver/sdl_video_player.h
+index 91c1cf44..db49ba4c 100644
+--- a/cast/standalone_receiver/sdl_video_player.h
++++ b/cast/standalone_receiver/sdl_video_player.h
+@@ -43,7 +43,7 @@ class SDLVideoPlayer final : public SDLPlayerBase {
+   void Present() final;
+ 
+   // Maps an AVFrame format enum to the SDL equivalent.
+-  static uint32_t GetSDLPixelFormat(const AVFrame& picture);
++  static SDL_PixelFormat GetSDLPixelFormat(const AVFrame& picture);
+ 
+   // The SDL renderer drawn to.
+   SDL_Renderer& renderer_;
+diff --git a/cast/standalone_receiver/streaming_playback_controller.cc b/cast/standalone_receiver/streaming_playback_controller.cc
+index 2c35b7c7..9dd7b2da 100644
+--- a/cast/standalone_receiver/streaming_playback_controller.cc
++++ b/cast/standalone_receiver/streaming_playback_controller.cc
+@@ -34,13 +34,12 @@ StreamingPlaybackController::StreamingPlaybackController(
+   OSP_CHECK(client_);
+   constexpr int kDefaultWindowWidth = 1280;
+   constexpr int kDefaultWindowHeight = 720;
+-  window_ = MakeUniqueSDLWindow(
+-      "Cast Streaming Receiver Demo",
+-      SDL_WINDOWPOS_UNDEFINED /* initial X position */,
+-      SDL_WINDOWPOS_UNDEFINED /* initial Y position */, kDefaultWindowWidth,
+-      kDefaultWindowHeight, SDL_WINDOW_RESIZABLE);
++  window_ = MakeUniqueSDLWindow("Cast Streaming Receiver Demo",
++                                kDefaultWindowWidth,
++                                kDefaultWindowHeight,
++                                SDL_WINDOW_RESIZABLE);
+   OSP_CHECK(window_) << "Failed to create SDL window: " << SDL_GetError();
+-  renderer_ = MakeUniqueSDLRenderer(window_.get(), -1, 0);
++  renderer_ = MakeUniqueSDLRenderer(window_.get(), nullptr);
+   OSP_CHECK(renderer_) << "Failed to create SDL renderer: " << SDL_GetError();
+ 
+   sdl_event_loop_.RegisterForKeyboardEvent(
+@@ -132,7 +131,7 @@ void StreamingPlaybackController::HandleKeyboardEvent(
+     return;
+   }
+ 
+-  switch (event.keysym.sym) {
++  switch (event.key) {
+     // See codes here: https://wiki.libsdl.org/SDL_Scancode
+     case SDLK_KP_SPACE:  // fallthrough, "Keypad Space"
+     case SDLK_SPACE:     // "Space"
+diff --git a/cast/streaming/external_libraries.gni b/cast/streaming/external_libraries.gni
+index 62274879..a9b82b14 100644
+--- a/cast/streaming/external_libraries.gni
++++ b/cast/streaming/external_libraries.gni
+@@ -23,10 +23,10 @@ declare_args() {
+   libopus_include_dirs = []
+   libopus_lib_dirs = []
+ 
+-  have_libsdl2 = false
+-  libsdl2_libs = [ "SDL2" ]
+-  libsdl2_include_dirs = []
+-  libsdl2_lib_dirs = []
++  have_libsdl3 = false
++  libsdl3_libs = [ "SDL3" ]
++  libsdl3_include_dirs = []
++  libsdl3_lib_dirs = []
+ 
+   have_libvpx = false
+   libvpx_libs = [ "vpx" ]
