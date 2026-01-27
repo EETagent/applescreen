@@ -44,6 +44,7 @@ ARGS=\"target_os=\\\"mac\\\" \
 target_cpu=\\\"$ARCH\\\" \
 mac_deployment_target=\\\"$DEPLOYMENT_TARGET\\\" \
 mac_min_system_version=\\\"$DEPLOYMENT_TARGET\\\" \
+openscreen_static_library=true \
 is_debug=false \
 is_clang=true \
 use_custom_libcxx=true \
