@@ -88,6 +88,12 @@ fi
 if [ -f \"$SRC_DIR/openscreen/out/$ARCH/cast_sender\" ]; then
     cp \"$SRC_DIR/openscreen/out/$ARCH/cast_sender\" \"$INSTALL_DIR/bin/\"
 fi
+if [ -f \"$SRC_DIR/openscreen/out/$ARCH/libcast_receiver_mylib.dylib\" ]; then
+    cp \"$SRC_DIR/openscreen/out/$ARCH/libcast_receiver_mylib.dylib\" \"$INSTALL_DIR/lib/\"
+fi
+if [ -f \"$SRC_DIR/openscreen/out/$ARCH/libcast_sender_mylib.dylib\" ]; then
+    cp \"$SRC_DIR/openscreen/out/$ARCH/libcast_sender_mylib.dylib\" \"$INSTALL_DIR/lib/\"
+fi
 "
 )
 
@@ -102,10 +108,20 @@ ARM_BIN=\"${CMAKE_BINARY_DIR}/install_arm/bin\"
 DEST_LIB=\"${CMAKE_BINARY_DIR}/install/lib\"
 DEST_BIN=\"${CMAKE_BINARY_DIR}/install/bin\"
 
-mkdir -p \"$DEST_LIB\"
-mkdir -p \"$DEST_BIN\"
+mkdir -p \"$DEST_LIB/x64\"
+mkdir -p \"$DEST_LIB/arm64\"
+mkdir -p \"$DEST_BIN/x64\"
+mkdir -p \"$DEST_BIN/arm64\"
 
-# TODO:
+# TODO: Ten custom libcxx kazí merge přes lipo.., ale nevadí to mít oddělené
+
+echo \"Copying x64 files...\"
+cp -r \"$X86_LIB/\"* \"$DEST_LIB/x64/\"
+cp -r \"$X86_BIN/\"* \"$DEST_BIN/x64/\"
+
+echo \"Copying arm64 files...\"
+cp -r \"$ARM_LIB/\"* \"$DEST_LIB/arm64/\"
+cp -r \"$ARM_BIN/\"* \"$DEST_BIN/arm64/\"
 "
 )
 
@@ -125,7 +141,7 @@ ExternalProject_Add(openscreen_x86
     CONFIGURE_COMMAND
         sh "${CONFIGURE_SCRIPT}" "<SOURCE_DIR>" "x64" "${CMAKE_BINARY_DIR}/install" "${CMAKE_OSX_DEPLOYMENT_TARGET}"
     BUILD_COMMAND
-        ninja -C <SOURCE_DIR>/openscreen/out/x64 cast_receiver cast_sender
+        ninja -C <SOURCE_DIR>/openscreen/out/x64 cast_receiver cast_sender cast_sender_mylib cast_receiver_mylib
     INSTALL_COMMAND
         sh "${INSTALL_SCRIPT}" "<SOURCE_DIR>" "${CMAKE_BINARY_DIR}/install_x86" "x64"
 )
@@ -138,7 +154,7 @@ ExternalProject_Add(openscreen_arm
     CONFIGURE_COMMAND
         sh "${CONFIGURE_SCRIPT}" "<SOURCE_DIR>" "arm64" "${CMAKE_BINARY_DIR}/install" "${CMAKE_OSX_DEPLOYMENT_TARGET}"
     BUILD_COMMAND
-        ninja -C <SOURCE_DIR>/openscreen/out/arm64 cast_receiver cast_sender
+        ninja -C <SOURCE_DIR>/openscreen/out/arm64 cast_receiver cast_sender cast_sender_mylib cast_receiver_mylib
     INSTALL_COMMAND
         sh "${INSTALL_SCRIPT}" "<SOURCE_DIR>" "${CMAKE_BINARY_DIR}/install_arm" "arm64"
 )
