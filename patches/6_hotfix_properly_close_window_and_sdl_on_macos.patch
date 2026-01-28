@@ -1,0 +1,114 @@
+diff --git a/cast/standalone_receiver/mirroring_application.cc b/cast/standalone_receiver/mirroring_application.cc
+index 559b3428..d0e7758b 100644
+--- a/cast/standalone_receiver/mirroring_application.cc
++++ b/cast/standalone_receiver/mirroring_application.cc
+@@ -99,4 +99,8 @@ void MirroringApplication::OnPlaybackError(StreamingPlaybackController*,
+   agent_.StopApplicationIfRunning(this);  // ApplicationAgent calls Stop().
+ }
+ 
++void MirroringApplication::OnSessionEnded() {
++  task_runner_.PostTask([this] { Stop(); });
++}
++
+ }  // namespace openscreen::cast
+diff --git a/cast/standalone_receiver/mirroring_application.h b/cast/standalone_receiver/mirroring_application.h
+index e371ca28..7fa3118a 100644
+--- a/cast/standalone_receiver/mirroring_application.h
++++ b/cast/standalone_receiver/mirroring_application.h
+@@ -50,6 +50,7 @@ class MirroringApplication final : public ApplicationAgent::Application,
+   // StreamingPlaybackController::Client overrides
+   void OnPlaybackError(StreamingPlaybackController* controller,
+                        const Error& error) final;
++  void OnSessionEnded() final;
+ 
+  private:
+   TaskRunner& task_runner_;
+diff --git a/cast/standalone_receiver/streaming_playback_controller.cc b/cast/standalone_receiver/streaming_playback_controller.cc
+index 9dd7b2da..807b4876 100644
+--- a/cast/standalone_receiver/streaming_playback_controller.cc
++++ b/cast/standalone_receiver/streaming_playback_controller.cc
+@@ -27,9 +27,13 @@ StreamingPlaybackController::StreamingPlaybackController(
+     : client_(client),
+       task_runner_(task_runner),
+       sdl_event_loop_(task_runner_, [this] {
+-        client_->OnPlaybackError(this,
+-                                 Error{Error::Code::kOperationCancelled,
++        task_runner_.PostTask([weak_this = weak_factory_.GetWeakPtr()] {
++          if (weak_this) {
++            weak_this->client_->OnPlaybackError(
++                weak_this.get(), Error{Error::Code::kOperationCancelled,
+                                        std::string("SDL event loop closed.")});
++          }
++        });
+       }) {
+   OSP_CHECK(client_);
+   constexpr int kDefaultWindowWidth = 1280;
+@@ -85,8 +89,37 @@ void StreamingPlaybackController::OnReceiversDestroying(
+     const ReceiverSession* session,
+     ReceiversDestroyingReason reason) {
+   OSP_LOG_INFO << "Receivers are currently destroying, resetting SDL players.";
+-  audio_player_.reset();
++  if (window_) {
++    const Uint32 flags = SDL_GetWindowFlags(window_.get());
++    if (flags & (SDL_WINDOW_FULLSCREEN)) {
++        OSP_LOG_INFO << "Exiting fullscreen mode before destroying window.";
++        SDL_SetWindowFullscreen(window_.get(), 0);
++        // TODO: On macOS fullscreen window gets stuck even after calling SDL_Quit, so this is a little dirty fix
++        SDL_SyncWindow(window_.get());
++    }
++  }
++
+   video_player_.reset();
++  audio_player_.reset();
++
++  if (renderer_) {
++    renderer_.reset();
++  }
++  if (window_) {
++    window_.reset();
++  }
++
++  // https://wiki.libsdl.org/SDL3/SDL_DestroyWindow
++  // Note that on some platforms, the visible window may not actually be removed
++  // from the screen until the SDL event loop is pumped again.
++  SDL_PumpEvents();
++  SDL_Quit();
++
++  OSP_LOG_INFO << "SDL window destroyed.";
++
++  if (reason == ReceiversDestroyingReason::kEndOfSession) {
++    client_->OnSessionEnded();
++  }
+ }
+ 
+ void StreamingPlaybackController::OnError(const ReceiverSession* session,
+diff --git a/cast/standalone_receiver/streaming_playback_controller.h b/cast/standalone_receiver/streaming_playback_controller.h
+index f6cfd67c..36d4d72c 100644
+--- a/cast/standalone_receiver/streaming_playback_controller.h
++++ b/cast/standalone_receiver/streaming_playback_controller.h
+@@ -10,6 +10,7 @@
+ #include "cast/standalone_receiver/simple_remoting_receiver.h"
+ #include "cast/streaming/public/receiver_session.h"
+ #include "platform/api/task_runner.h"
++#include "util/weak_ptr.h"
+ 
+ #if defined(CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS)
+ #include "cast/standalone_receiver/sdl_audio_player.h"  // nogncheck
+@@ -28,6 +29,8 @@ class StreamingPlaybackController final : public ReceiverSession::Client {
+     virtual void OnPlaybackError(StreamingPlaybackController* controller,
+                                  const Error& error) = 0;
+ 
++    virtual void OnSessionEnded() = 0;
++
+    protected:
+     virtual ~Client();
+   };
+@@ -78,6 +81,8 @@ class StreamingPlaybackController final : public ReceiverSession::Client {
+ #endif  // defined(CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS)
+ 
+   std::unique_ptr<SimpleRemotingReceiver> remoting_receiver_;
++
++  WeakPtrFactory<StreamingPlaybackController> weak_factory_{this};
+ };
+ 
+ }  // namespace openscreen::cast
