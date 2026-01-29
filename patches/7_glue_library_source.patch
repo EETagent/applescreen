@@ -1,0 +1,2614 @@
+diff --git a/cast/standalone_receiver/my_lib.cc b/cast/standalone_receiver/my_lib.cc
+index 29751036..9c84a82f 100644
+--- a/cast/standalone_receiver/my_lib.cc
++++ b/cast/standalone_receiver/my_lib.cc
+@@ -1,4 +1,1093 @@
+-extern "C" __attribute__((visibility("default"))) int todo(int argc,
+-                                                            char* argv[]) {
++#include "cast/standalone_receiver/my_lib.h"
++
++#include <atomic>
++#include <condition_variable>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++#include "cast/common/public/cast_streaming_app_ids.h"
++#include "cast/common/public/message_port.h"
++#include "cast/receiver/application_agent.h"
++#include "cast/receiver/channel/static_credentials.h"
++#include "cast/receiver/public/receiver_socket_factory.h"
++#include "cast/standalone_receiver/cast_service.h"
++#include "cast/standalone_receiver/streaming_playback_controller.h"
++#include "cast/streaming/message_fields.h"
++#include "cast/streaming/public/constants.h"
++#include "cast/streaming/public/environment.h"
++#include "cast/streaming/public/receiver_constraints.h"
++#include "cast/streaming/public/receiver_session.h"
++#include "discovery/common/config.h"
++#include "discovery/public/dns_sd_service_factory.h"
++#include "discovery/public/dns_sd_service_publisher.h"
++#include "platform/api/task_runner_deleter.h"
++#include "platform/api/time.h"
++#include "platform/api/tls_connection_factory.h"
++#include "platform/base/error.h"
++#include "platform/base/interface_info.h"
++#include "platform/base/ip_address.h"
++#include "platform/base/tls_listen_options.h"
++#include "platform/impl/logging.h"
++#include "platform/impl/network_interface.h"
++#include "platform/impl/platform_client_posix.h"
++#include "platform/impl/task_runner.h"
++#include "util/chrono_helpers.h"
++#include "util/crypto/random_bytes.h"
++#include "util/osp_logging.h"
++#include "util/uuid.h"
++
++#if defined(CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS)
++#include "cast/standalone_receiver/avcodec_glue.h"
++#include "cast/standalone_receiver/decoder.h"
++#endif
++
++namespace openscreen::cast {
++namespace {
++
++struct VideoFrameBuffer {
++  CastVideoFrame frame;
++  std::vector<std::vector<uint8_t>> plane_data;
++  bool in_use = false;
++};
++
++struct AudioFrameBuffer {
++  CastAudioFrame frame;
++  std::vector<std::vector<uint8_t>> plane_data;
++  bool in_use = false;
++};
++
++}  // namespace
++}  // namespace openscreen::cast
++
++struct CastFrameBufferPool {
++  std::mutex mutex;
++  std::vector<openscreen::cast::VideoFrameBuffer> video_frames;
++  std::vector<openscreen::cast::AudioFrameBuffer> audio_frames;
++  int64_t next_video_handle = 0;
++  int64_t next_audio_handle = 0;
++  std::vector<int64_t> video_handle_to_index;
++  std::vector<int64_t> audio_handle_to_index;
++};
++
++namespace openscreen::cast {
++namespace {
++
++
++class AppKitPlaybackController final : public ReceiverSession::Client {
++ public:
++  class Client {
++   public:
++    virtual void OnPlaybackError(AppKitPlaybackController* controller,
++                                 const Error& error) = 0;
++    virtual void OnSessionEnded() = 0;
++
++   protected:
++    virtual ~Client() = default;
++  };
++
++  AppKitPlaybackController(TaskRunner& task_runner,
++                           Client* client,
++                           const CastReceiverCallbacks* callbacks);
++  ~AppKitPlaybackController();
++
++  // ReceiverSession::Client overrides.
++  void OnNegotiated(const ReceiverSession* session,
++                    ReceiverSession::ConfiguredReceivers receivers) override;
++  void OnRemotingNegotiated(
++      const ReceiverSession* session,
++      ReceiverSession::RemotingNegotiation negotiation) override;
++  void OnReceiversDestroying(const ReceiverSession* session,
++                             ReceiversDestroyingReason reason) override;
++  void OnError(const ReceiverSession* session, const Error& error) override;
++
++ private:
++  void Initialize(ReceiverSession::ConfiguredReceivers receivers);
++
++#if defined(CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS)
++  // Internal decoder client for video
++  class VideoDecoderClient : public Decoder::Client {
++   public:
++    VideoDecoderClient(AppKitPlaybackController* owner) : owner_(owner) {}
++    void OnFrameDecoded(FrameId frame_id, const AVFrame& frame) override;
++    void OnDecodeError(FrameId frame_id, const std::string& message) override;
++    void OnFatalError(const std::string& message) override;
++
++   private:
++    AppKitPlaybackController* owner_;
++  };
++
++  // Internal decoder client for audio
++  class AudioDecoderClient : public Decoder::Client {
++   public:
++    AudioDecoderClient(AppKitPlaybackController* owner) : owner_(owner) {}
++    void OnFrameDecoded(FrameId frame_id, const AVFrame& frame) override;
++    void OnDecodeError(FrameId frame_id, const std::string& message) override;
++    void OnFatalError(const std::string& message) override;
++
++   private:
++    AppKitPlaybackController* owner_;
++  };
++
++  // Frame consumer for video receiver
++  class VideoFrameConsumer : public Receiver::Consumer {
++   public:
++    VideoFrameConsumer(AppKitPlaybackController* owner) : owner_(owner) {}
++    void OnFramesReady(int next_frame_buffer_size) override;
++
++   private:
++    AppKitPlaybackController* owner_;
++  };
++
++  class AudioFrameConsumer : public Receiver::Consumer {
++   public:
++    AudioFrameConsumer(AppKitPlaybackController* owner) : owner_(owner) {}
++    void OnFramesReady(int next_frame_buffer_size) override;
++
++   private:
++    AppKitPlaybackController* owner_;
++  };
++
++  void OnVideoFrameDecoded(FrameId frame_id, const AVFrame& frame);
++  void OnAudioFrameDecoded(FrameId frame_id, const AVFrame& frame);
++  void OnVideoFramesReady(int buffer_size);
++  void OnAudioFramesReady(int buffer_size);
++
++  std::unique_ptr<VideoDecoderClient> video_decoder_client_;
++  std::unique_ptr<AudioDecoderClient> audio_decoder_client_;
++  std::unique_ptr<VideoFrameConsumer> video_frame_consumer_;
++  std::unique_ptr<AudioFrameConsumer> audio_frame_consumer_;
++  std::unique_ptr<Decoder> video_decoder_;
++  std::unique_ptr<Decoder> audio_decoder_;
++  Decoder::Buffer video_buffer_;
++  Decoder::Buffer audio_buffer_;
++  Receiver* video_receiver_ = nullptr;
++  Receiver* audio_receiver_ = nullptr;
++#endif
++
++  Client* client_;
++  TaskRunner& task_runner_;
++  CastReceiverCallbacks callbacks_;
++  bool session_active_ = false;
++  int current_width_ = 0;
++  int current_height_ = 0;
++};
++
++AppKitPlaybackController::AppKitPlaybackController(
++    TaskRunner& task_runner,
++    Client* client,
++    const CastReceiverCallbacks* callbacks)
++    : client_(client), task_runner_(task_runner), callbacks_(*callbacks) {
++  OSP_CHECK(client_);
++}
++
++AppKitPlaybackController::~AppKitPlaybackController() = default;
++
++void AppKitPlaybackController::OnNegotiated(
++    const ReceiverSession* session,
++    ReceiverSession::ConfiguredReceivers receivers) {
++  Initialize(receivers);
++}
++
++void AppKitPlaybackController::OnRemotingNegotiated(
++    const ReceiverSession* session,
++    ReceiverSession::RemotingNegotiation negotiation) {
++  Initialize(negotiation.receivers);
++}
++
++void AppKitPlaybackController::OnReceiversDestroying(
++    const ReceiverSession* session,
++    ReceiversDestroyingReason reason) {
++  OSP_LOG_INFO << "Receivers are being destroyed.";
++
++#if defined(CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS)
++  if (video_decoder_) {
++    video_decoder_->set_client(nullptr);
++    video_decoder_.reset();
++  }
++  if (audio_decoder_) {
++    audio_decoder_->set_client(nullptr);
++    audio_decoder_.reset();
++  }
++  if (video_receiver_) {
++    video_receiver_->SetConsumer(nullptr);
++    video_receiver_ = nullptr;
++  }
++  if (audio_receiver_) {
++    audio_receiver_->SetConsumer(nullptr);
++    audio_receiver_ = nullptr;
++  }
++#endif
++
++  if (session_active_ && callbacks_.on_window_close) {
++    callbacks_.on_window_close(callbacks_.user_data);
++  }
++  session_active_ = false;
++
++  if (reason == ReceiversDestroyingReason::kEndOfSession) {
++    client_->OnSessionEnded();
++  }
++}
++
++void AppKitPlaybackController::OnError(const ReceiverSession* session,
++                                       const Error& error) {
++  if (callbacks_.on_error) {
++    callbacks_.on_error(callbacks_.user_data, static_cast<int>(error.code()),
++                        error.message().c_str());
++  }
++  client_->OnPlaybackError(this, error);
++}
++
++void AppKitPlaybackController::Initialize(
++    ReceiverSession::ConfiguredReceivers receivers) {
++  OSP_LOG_INFO << "Session negotiated, initializing playback.";
++
++  if (!session_active_ && callbacks_.on_window_open) {
++    CastWindowConfig config;
++    config.width = 1280;
++    config.height = 720;
++    config.title = "Cast Receiver";
++    current_width_ = config.width;
++    current_height_ = config.height;
++    callbacks_.on_window_open(callbacks_.user_data, &config);
++  }
++  session_active_ = true;
++
++#if defined(CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS)
++  if (receivers.video_receiver) {
++    video_receiver_ = receivers.video_receiver;
++
++    std::string video_codec_name =
++        CodecToString(receivers.video_config.codec);
++    video_decoder_ = std::make_unique<Decoder>(video_codec_name);
++    video_decoder_client_ = std::make_unique<VideoDecoderClient>(this);
++    video_decoder_->set_client(video_decoder_client_.get());
++
++    video_frame_consumer_ = std::make_unique<VideoFrameConsumer>(this);
++    video_receiver_->SetConsumer(video_frame_consumer_.get());
++  }
++
++  if (receivers.audio_receiver) {
++    audio_receiver_ = receivers.audio_receiver;
++
++    std::string audio_codec_name =
++        CodecToString(receivers.audio_config.codec);
++    audio_decoder_ = std::make_unique<Decoder>(audio_codec_name);
++    audio_decoder_client_ = std::make_unique<AudioDecoderClient>(this);
++    audio_decoder_->set_client(audio_decoder_client_.get());
++
++    audio_frame_consumer_ = std::make_unique<AudioFrameConsumer>(this);
++    audio_receiver_->SetConsumer(audio_frame_consumer_.get());
++  }
++#endif
++}
++
++#if defined(CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS)
++
++void AppKitPlaybackController::VideoDecoderClient::OnFrameDecoded(
++    FrameId frame_id,
++    const AVFrame& frame) {
++  owner_->OnVideoFrameDecoded(frame_id, frame);
++}
++
++void AppKitPlaybackController::VideoDecoderClient::OnDecodeError(
++    FrameId frame_id,
++    const std::string& message) {
++  OSP_LOG_WARN << "Video decode error for frame " << frame_id << ": "
++               << message;
++  if (owner_->video_receiver_) {
++    owner_->video_receiver_->RequestKeyFrame();
++  }
++}
++
++void AppKitPlaybackController::VideoDecoderClient::OnFatalError(
++    const std::string& message) {
++  OSP_LOG_ERROR << "Fatal video decoder error: " << message;
++  if (owner_->callbacks_.on_error) {
++    owner_->callbacks_.on_error(owner_->callbacks_.user_data, -1,
++                                message.c_str());
++  }
++}
++
++void AppKitPlaybackController::AudioDecoderClient::OnFrameDecoded(
++    FrameId frame_id,
++    const AVFrame& frame) {
++  owner_->OnAudioFrameDecoded(frame_id, frame);
++}
++
++void AppKitPlaybackController::AudioDecoderClient::OnDecodeError(
++    FrameId frame_id,
++    const std::string& message) {
++  OSP_LOG_WARN << "Audio decode error for frame " << frame_id << ": "
++               << message;
++  if (owner_->audio_receiver_) {
++    owner_->audio_receiver_->RequestKeyFrame();
++  }
++}
++
++void AppKitPlaybackController::AudioDecoderClient::OnFatalError(
++    const std::string& message) {
++  OSP_LOG_ERROR << "Fatal audio decoder error: " << message;
++  if (owner_->callbacks_.on_error) {
++    owner_->callbacks_.on_error(owner_->callbacks_.user_data, -1,
++                                message.c_str());
++  }
++}
++
++void AppKitPlaybackController::VideoFrameConsumer::OnFramesReady(
++    int next_frame_buffer_size) {
++  owner_->OnVideoFramesReady(next_frame_buffer_size);
++}
++
++void AppKitPlaybackController::AudioFrameConsumer::OnFramesReady(
++    int next_frame_buffer_size) {
++  owner_->OnAudioFramesReady(next_frame_buffer_size);
++}
++
++void AppKitPlaybackController::OnVideoFramesReady(int buffer_size) {
++  if (!video_receiver_ || !video_decoder_) {
++    return;
++  }
++
++  video_buffer_.Resize(buffer_size);
++  EncodedFrame frame = video_receiver_->ConsumeNextFrame(
++      video_buffer_.AsByteBuffer());
++  video_decoder_->Decode(frame.frame_id, video_buffer_);
++}
++
++void AppKitPlaybackController::OnAudioFramesReady(int buffer_size) {
++  if (!audio_receiver_ || !audio_decoder_) {
++    return;
++  }
++
++  audio_buffer_.Resize(buffer_size);
++  EncodedFrame frame = audio_receiver_->ConsumeNextFrame(
++      audio_buffer_.AsByteBuffer());
++  audio_decoder_->Decode(frame.frame_id, audio_buffer_);
++}
++
++void AppKitPlaybackController::OnVideoFrameDecoded(FrameId frame_id,
++                                                   const AVFrame& frame) {
++  if (!callbacks_.on_video_frame) {
++    return;
++  }
++
++  CastVideoFrame video_frame;
++  video_frame.width = frame.width;
++  video_frame.height = frame.height;
++  video_frame.pts_us = frame.pts;
++  video_frame.duration_us = frame.duration;
++
++  if (frame.width != current_width_ || frame.height != current_height_) {
++    current_width_ = frame.width;
++    current_height_ = frame.height;
++    if (callbacks_.on_window_resize) {
++      callbacks_.on_window_resize(callbacks_.user_data, frame.width,
++                                  frame.height);
++    }
++  }
++
++  switch (frame.format) {
++    case AV_PIX_FMT_YUV420P:
++    case AV_PIX_FMT_YUVJ420P:
++      video_frame.format = kPixelFormatYUV420P;
++      video_frame.plane_count = 3;
++      video_frame.planes[0] = frame.data[0];
++      video_frame.planes[1] = frame.data[1];
++      video_frame.planes[2] = frame.data[2];
++      video_frame.line_sizes[0] = frame.linesize[0];
++      video_frame.line_sizes[1] = frame.linesize[1];
++      video_frame.line_sizes[2] = frame.linesize[2];
++      break;
++    case AV_PIX_FMT_NV12:
++      video_frame.format = kPixelFormatNV12;
++      video_frame.plane_count = 2;
++      video_frame.planes[0] = frame.data[0];
++      video_frame.planes[1] = frame.data[1];
++      video_frame.line_sizes[0] = frame.linesize[0];
++      video_frame.line_sizes[1] = frame.linesize[1];
++      break;
++    case AV_PIX_FMT_RGBA:
++      video_frame.format = kPixelFormatRGBA;
++      video_frame.plane_count = 1;
++      video_frame.planes[0] = frame.data[0];
++      video_frame.line_sizes[0] = frame.linesize[0];
++      break;
++    case AV_PIX_FMT_BGRA:
++      video_frame.format = kPixelFormatBGRA;
++      video_frame.plane_count = 1;
++      video_frame.planes[0] = frame.data[0];
++      video_frame.line_sizes[0] = frame.linesize[0];
++      break;
++    default:
++      video_frame.format = kPixelFormatUnknown;
++      video_frame.plane_count = 0;
++      OSP_LOG_WARN << "Unknown video pixel format: " << frame.format;
++      return;
++  }
++
++  callbacks_.on_video_frame(callbacks_.user_data, &video_frame);
++}
++
++void AppKitPlaybackController::OnAudioFrameDecoded(FrameId frame_id,
++                                                   const AVFrame& frame) {
++  if (!callbacks_.on_audio_frame) {
++    return;
++  }
++
++  CastAudioFrame audio_frame;
++  audio_frame.sample_rate = frame.sample_rate;
++#if _LIBAVUTIL_OLD_CHANNEL_LAYOUT
++  audio_frame.channels = frame.channels;
++#else
++  audio_frame.channels = frame.ch_layout.nb_channels;
++#endif
++  audio_frame.samples_per_channel = frame.nb_samples;
++  audio_frame.pts_us = frame.pts;
++  audio_frame.duration_us = frame.duration;
++
++  bool is_planar = av_sample_fmt_is_planar(
++      static_cast<AVSampleFormat>(frame.format));
++
++  switch (frame.format) {
++    case AV_SAMPLE_FMT_S16:
++      audio_frame.format = kAudioFormatS16;
++      break;
++    case AV_SAMPLE_FMT_S16P:
++      audio_frame.format = kAudioFormatPlanarS16;
++      break;
++    case AV_SAMPLE_FMT_S32:
++    case AV_SAMPLE_FMT_S32P:
++      audio_frame.format = kAudioFormatS32;
++      break;
++    case AV_SAMPLE_FMT_FLT:
++      audio_frame.format = kAudioFormatFloat;
++      break;
++    case AV_SAMPLE_FMT_FLTP:
++      audio_frame.format = kAudioFormatPlanarFloat;
++      break;
++    default:
++      audio_frame.format = kAudioFormatUnknown;
++      OSP_LOG_WARN << "Unknown audio sample format: " << frame.format;
++      return;
++  }
++
++  if (is_planar) {
++    audio_frame.plane_count = audio_frame.channels;
++    int bytes_per_sample = av_get_bytes_per_sample(
++        static_cast<AVSampleFormat>(frame.format));
++    int plane_size = frame.nb_samples * bytes_per_sample;
++    for (int i = 0; i < audio_frame.channels && i < 8; ++i) {
++      audio_frame.planes[i] = frame.data[i];
++      audio_frame.plane_sizes[i] = plane_size;
++    }
++  } else {
++    audio_frame.plane_count = 1;
++    int bytes_per_sample = av_get_bytes_per_sample(
++        static_cast<AVSampleFormat>(frame.format));
++    audio_frame.planes[0] = frame.data[0];
++    audio_frame.plane_sizes[0] =
++        frame.nb_samples * audio_frame.channels * bytes_per_sample;
++  }
++
++  callbacks_.on_audio_frame(callbacks_.user_data, &audio_frame);
++}
++
++#endif  // defined(CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS)
++
++class AppKitMirroringApplication final
++    : public ApplicationAgent::Application,
++      public AppKitPlaybackController::Client {
++ public:
++  AppKitMirroringApplication(TaskRunner& task_runner,
++                             const IPAddress& interface_address,
++                             ApplicationAgent& agent,
++                             bool enable_dscp,
++                             const CastReceiverCallbacks* callbacks);
++  ~AppKitMirroringApplication() final;
++
++  const std::vector<std::string>& GetAppIds() const final;
++  bool Launch(const std::string& app_id,
++              const Json::Value& app_params,
++              MessagePort* message_port) final;
++  std::string GetSessionId() final;
++  std::string GetDisplayName() final;
++  std::vector<std::string> GetSupportedNamespaces() final;
++  void Stop() final;
++
++  void OnPlaybackError(AppKitPlaybackController* controller,
++                       const Error& error) final;
++  void OnSessionEnded() final;
++
++ private:
++  TaskRunner& task_runner_;
++  const IPAddress interface_address_;
++  const std::vector<std::string> app_ids_;
++  ApplicationAgent& agent_;
++  const bool enable_dscp_;
++  CastReceiverCallbacks callbacks_;
++
++  std::unique_ptr<Environment> environment_;
++  std::unique_ptr<AppKitPlaybackController> controller_;
++  std::unique_ptr<ReceiverSession> current_session_;
++};
++
++AppKitMirroringApplication::AppKitMirroringApplication(
++    TaskRunner& task_runner,
++    const IPAddress& interface_address,
++    ApplicationAgent& agent,
++    bool enable_dscp,
++    const CastReceiverCallbacks* callbacks)
++    : task_runner_(task_runner),
++      interface_address_(interface_address),
++      app_ids_(GetCastStreamingAppIds()),
++      agent_(agent),
++      enable_dscp_(enable_dscp),
++      callbacks_(*callbacks) {
++  agent_.RegisterApplication(this);
++}
++
++AppKitMirroringApplication::~AppKitMirroringApplication() {
++  agent_.UnregisterApplication(this);
++  OSP_CHECK(!current_session_);
++}
++
++const std::vector<std::string>& AppKitMirroringApplication::GetAppIds() const {
++  return app_ids_;
++}
++
++bool AppKitMirroringApplication::Launch(const std::string& app_id,
++                                        const Json::Value& app_params,
++                                        MessagePort* message_port) {
++  if (!IsCastStreamingAppId(app_id) || !message_port || current_session_) {
++    return false;
++  }
++
++  environment_ = std::make_unique<Environment>(
++      &Clock::now, task_runner_,
++      IPEndpoint{interface_address_, kDefaultCastStreamingPort});
++
++  controller_ = std::make_unique<AppKitPlaybackController>(
++      task_runner_, this, &callbacks_);
++
++  ReceiverConstraints constraints;
++  constraints.video_codecs.insert(constraints.video_codecs.begin(),
++                                  {VideoCodec::kAv1, VideoCodec::kVp9});
++  constraints.remoting = std::make_unique<RemotingConstraints>();
++  constraints.enable_dscp = enable_dscp_;
++
++  current_session_ = std::make_unique<ReceiverSession>(
++      *controller_, *environment_, *message_port, std::move(constraints));
++
++  return true;
++}
++
++std::string AppKitMirroringApplication::GetSessionId() {
++  return current_session_ ? current_session_->session_id() : std::string();
++}
++
++std::string AppKitMirroringApplication::GetDisplayName() {
++  return current_session_ ? "Chrome Mirroring" : std::string();
++}
++
++std::vector<std::string> AppKitMirroringApplication::GetSupportedNamespaces() {
++  return {kCastWebrtcNamespace, "urn:x-cast:com.google.cast.remoting"};
++}
++
++void AppKitMirroringApplication::Stop() {
++  current_session_.reset();
++  controller_.reset();
++  environment_.reset();
++}
++
++void AppKitMirroringApplication::OnPlaybackError(
++    AppKitPlaybackController*,
++    const Error& error) {
++  OSP_LOG_ERROR << "[AppKitMirroringApplication] " << error;
++  agent_.StopApplicationIfRunning(this);
++}
++
++void AppKitMirroringApplication::OnSessionEnded() {
++  task_runner_.PostTask([this] { Stop(); });
++}
++
++class AppKitCastService final : public discovery::ReportingClient {
++ public:
++  struct Configuration {
++    TaskRunner& task_runner;
++    InterfaceInfo interface;
++    GeneratedCredentials credentials;
++    std::string device_uuid;
++    std::string friendly_name;
++    std::string model_name;
++    bool enable_discovery;
++    bool enable_dscp;
++    const CastReceiverCallbacks* callbacks;
++  };
++
++  explicit AppKitCastService(Configuration config);
++  ~AppKitCastService() final;
++
++ private:
++  using LazyDeletedDiscoveryPublisher =
++      std::unique_ptr<discovery::DnsSdServicePublisher<ReceiverInfo>,
++                      TaskRunnerDeleter>;
++
++  void OnFatalError(const Error& error) final;
++  void OnRecoverableError(const Error& error) final;
++
++  const IPEndpoint local_endpoint_;
++  const GeneratedCredentials credentials_;
++
++  ApplicationAgent agent_;
++  AppKitMirroringApplication mirroring_application_;
++  ReceiverSocketFactory socket_factory_;
++  std::unique_ptr<TlsConnectionFactory> connection_factory_;
++
++  discovery::DnsSdServicePtr discovery_service_;
++  LazyDeletedDiscoveryPublisher discovery_publisher_;
++};
++
++namespace {
++constexpr uint16_t kDefaultCastServicePort = 8010;
++constexpr int kCastUniqueIdLength = 6;
++constexpr int kDefaultMaxBacklogSize = 64;
++constexpr TlsListenOptions kDefaultListenOptions = {kDefaultMaxBacklogSize};
++
++IPEndpoint DetermineEndpoint(const InterfaceInfo& interface) {
++  const IPAddress address = interface.GetIpAddressV4()
++                                ? interface.GetIpAddressV4()
++                                : interface.GetIpAddressV6();
++  OSP_CHECK(address);
++  return IPEndpoint{address, kDefaultCastServicePort};
++}
++
++discovery::Config MakeDiscoveryConfig(const InterfaceInfo& interface) {
++  return discovery::Config{.network_info = {interface}};
++}
++}  // namespace
++
++AppKitCastService::AppKitCastService(AppKitCastService::Configuration config)
++    : local_endpoint_(DetermineEndpoint(config.interface)),
++      credentials_(std::move(config.credentials)),
++      agent_(config.task_runner, *credentials_.provider, config.device_uuid),
++      mirroring_application_(config.task_runner,
++                             local_endpoint_.address,
++                             agent_,
++                             config.enable_dscp,
++                             config.callbacks),
++      socket_factory_(agent_, *agent_.cast_socket_client()),
++      connection_factory_(
++          TlsConnectionFactory::CreateFactory(socket_factory_,
++                                              config.task_runner)),
++      discovery_service_(config.enable_discovery
++                             ? discovery::CreateDnsSdService(
++                                   config.task_runner,
++                                   *this,
++                                   MakeDiscoveryConfig(config.interface))
++                             : discovery::DnsSdServicePtr()),
++      discovery_publisher_(
++          discovery_service_
++              ? LazyDeletedDiscoveryPublisher(
++                    new discovery::DnsSdServicePublisher<ReceiverInfo>(
++                        discovery_service_.get(),
++                        kCastV2ServiceId,
++                        ReceiverInfoToDnsSdInstance),
++                    TaskRunnerDeleter(config.task_runner))
++              : LazyDeletedDiscoveryPublisher()) {
++  connection_factory_->SetListenCredentials(credentials_.tls_credentials);
++  connection_factory_->Listen(local_endpoint_, kDefaultListenOptions);
++
++  if (discovery_publisher_) {
++    ReceiverInfo info;
++    info.port = local_endpoint_.port;
++    if (config.interface.HasHardwareAddress()) {
++      info.unique_id = HexEncode(config.interface.hardware_address.data(),
++                                 config.interface.hardware_address.size());
++    } else {
++      OSP_LOG_WARN << "Hardware address for interface "
++                   << config.interface.name
++                   << " is empty. Generating a random unique_id.";
++      std::array<uint8_t, kCastUniqueIdLength> random_bytes;
++      GenerateRandomBytes(random_bytes);
++      info.unique_id = HexEncode(random_bytes);
++    }
++    info.friendly_name = config.friendly_name;
++    info.model_name = config.model_name;
++    info.capabilities = kHasVideoOutput | kHasAudioOutput;
++    const Error error = discovery_publisher_->Register(info);
++    if (!error.ok()) {
++      OnFatalError(error);
++    }
++  }
++}
++
++AppKitCastService::~AppKitCastService() {
++  if (discovery_publisher_) {
++    discovery_publisher_->DeregisterAll();
++  }
++}
++
++void AppKitCastService::OnFatalError(const Error& error) {
++  OSP_LOG_FATAL << "Encountered fatal discovery error: " << error;
++}
++
++void AppKitCastService::OnRecoverableError(const Error& error) {
++  OSP_LOG_ERROR << "Encountered recoverable discovery error: " << error;
++}
++
++InterfaceInfo GetInterfaceInfoFromName(const char* name) {
++  OSP_CHECK(name) << "Missing mandatory argument: interface";
++  InterfaceInfo interface_info;
++  std::vector<InterfaceInfo> network_interfaces = GetNetworkInterfaces();
++  for (auto& interface : network_interfaces) {
++    if (interface.name == name) {
++      interface_info = std::move(interface);
++      break;
++    }
++  }
++  return interface_info;
++}
++
++}  // namespace
++}  // namespace openscreen::cast
++
++struct CastReceiver {
++  std::unique_ptr<std::thread> receiver_thread;
++  std::atomic<bool> running{false};
++  std::atomic<bool> has_active_session{false};
++  std::mutex mutex;
++  std::condition_variable cv;
++
++  std::string interface_name;
++  std::string certificate_path;
++  std::string private_key_path;
++  std::string friendly_name;
++  std::string model_name;
++  bool enable_discovery;
++  bool enable_dscp;
++
++  CastReceiverCallbacks callbacks;
++
++  openscreen::TaskRunnerImpl* task_runner = nullptr;
++  std::unique_ptr<openscreen::cast::AppKitCastService> service;
++};
++
++extern "C" {
++
++CastReceiver* cast_receiver_create(const CastReceiverConfig* config,
++                                   const CastReceiverCallbacks* callbacks) {
++  if (!config || !callbacks) {
++    return nullptr;
++  }
++
++  auto receiver = std::make_unique<CastReceiver>();
++
++  if (config->interface_name) {
++    receiver->interface_name = config->interface_name;
++  }
++  if (config->certificate_path) {
++    receiver->certificate_path = config->certificate_path;
++  }
++  if (config->private_key_path) {
++    receiver->private_key_path = config->private_key_path;
++  }
++  receiver->friendly_name =
++      config->friendly_name ? config->friendly_name : "Cast Receiver";
++  receiver->model_name =
++      config->model_name ? config->model_name : "cast_receiver";
++  receiver->enable_discovery = config->enable_discovery;
++  receiver->enable_dscp = config->enable_dscp;
++
++  receiver->callbacks = *callbacks;
++
++  return receiver.release();
++}
++
++int cast_receiver_start(CastReceiver* receiver) {
++  if (!receiver || receiver->running.load()) {
++    return -1;
++  }
++
++  if (receiver->interface_name.empty()) {
++    if (receiver->callbacks.on_error) {
++      receiver->callbacks.on_error(receiver->callbacks.user_data, -1,
++                                   "Interface name is required");
++    }
++    return -1;
++  }
++
++  if (receiver->certificate_path.empty() ||
++      receiver->private_key_path.empty()) {
++    if (receiver->callbacks.on_error) {
++      receiver->callbacks.on_error(
++          receiver->callbacks.user_data, -1,
++          "Certificate and private key paths are required");
++    }
++    return -1;
++  }
++
++  receiver->running.store(true);
++
++  receiver->receiver_thread = std::make_unique<std::thread>([receiver]() {
++    using namespace openscreen;
++    using namespace openscreen::cast;
++
++    InterfaceInfo interface =
++        GetInterfaceInfoFromName(receiver->interface_name.c_str());
++    if (interface.name.empty()) {
++      receiver->running.store(false);
++      if (receiver->callbacks.on_error) {
++        receiver->callbacks.on_error(receiver->callbacks.user_data, -1,
++                                     "Invalid interface name");
++      }
++      return;
++    }
++
++    const std::string receiver_id =
++        std::string("Standalone Receiver on ") + receiver->interface_name;
++    ErrorOr<GeneratedCredentials> creds = GenerateCredentials(
++        receiver_id, receiver->private_key_path, receiver->certificate_path);
++    if (!creds.is_value()) {
++      receiver->running.store(false);
++      if (receiver->callbacks.on_error) {
++        receiver->callbacks.on_error(receiver->callbacks.user_data, -1,
++                                     "Failed to generate credentials");
++      }
++      return;
++    }
++
++    auto* task_runner_ptr = new TaskRunnerImpl(&Clock::now);
++    receiver->task_runner = task_runner_ptr;
++    PlatformClientPosix::Create(milliseconds(50),
++                                std::unique_ptr<TaskRunnerImpl>(task_runner_ptr));
++
++    task_runner_ptr->PostTask([receiver, &interface,
++                               creds = std::move(creds.value())]() mutable {
++      receiver->service = std::make_unique<AppKitCastService>(
++          AppKitCastService::Configuration{
++              *receiver->task_runner, interface, std::move(creds),
++              Uuid::GenerateRandomV4().AsLowercaseString(),
++              receiver->friendly_name, receiver->model_name,
++              receiver->enable_discovery, receiver->enable_dscp,
++              &receiver->callbacks});
++    });
++
++    OSP_LOG_INFO << "CastReceiver is running.";
++
++    task_runner_ptr->RunUntilSignaled();
++
++    OSP_LOG_INFO << "Shutting down CastReceiver...";
++    task_runner_ptr->PostTask([receiver, task_runner_ptr]() {
++      receiver->service.reset();
++      task_runner_ptr->RequestStopSoon();
++    });
++    task_runner_ptr->RunUntilStopped();
++
++    PlatformClientPosix::ShutDown();
++    receiver->running.store(false);
++    receiver->task_runner = nullptr;
++
++    OSP_LOG_INFO << "CastReceiver stopped.";
++  });
++
++  return 0;
++}
++
++int cast_receiver_stop(CastReceiver* receiver) {
++  if (!receiver || !receiver->running.load()) {
++    return -1;
++  }
++
++  if (receiver->task_runner) {
++    receiver->task_runner->RequestStopSoon();
++  }
++
++  if (receiver->receiver_thread && receiver->receiver_thread->joinable()) {
++    receiver->receiver_thread->join();
++  }
++  receiver->receiver_thread.reset();
++
+   return 0;
+ }
++
++void cast_receiver_destroy(CastReceiver* receiver) {
++  if (!receiver) {
++    return;
++  }
++
++  if (receiver->running.load()) {
++    cast_receiver_stop(receiver);
++  }
++
++  delete receiver;
++}
++
++bool cast_receiver_is_running(const CastReceiver* receiver) {
++  return receiver && receiver->running.load();
++}
++
++bool cast_receiver_has_active_session(const CastReceiver* receiver) {
++  return receiver && receiver->has_active_session.load();
++}
++
++CastFrameBufferPool* cast_frame_pool_create(int max_video_frames,
++                                            int max_audio_frames) {
++  auto pool = std::make_unique<CastFrameBufferPool>();
++  pool->video_frames.resize(max_video_frames);
++  pool->audio_frames.resize(max_audio_frames);
++  pool->video_handle_to_index.resize(max_video_frames, -1);
++  pool->audio_handle_to_index.resize(max_audio_frames, -1);
++  return pool.release();
++}
++
++void cast_frame_pool_destroy(CastFrameBufferPool* pool) {
++  delete pool;
++}
++
++int64_t cast_frame_pool_copy_video(CastFrameBufferPool* pool,
++                                   const CastVideoFrame* frame) {
++  if (!pool || !frame) {
++    return -1;
++  }
++
++  std::lock_guard<std::mutex> lock(pool->mutex);
++
++  int slot = -1;
++  for (size_t i = 0; i < pool->video_frames.size(); ++i) {
++    if (!pool->video_frames[i].in_use) {
++      slot = static_cast<int>(i);
++      break;
++    }
++  }
++
++  if (slot < 0) {
++    return -1;
++  }
++
++  auto& buffer = pool->video_frames[slot];
++  buffer.in_use = true;
++  buffer.frame = *frame;
++  buffer.plane_data.clear();
++  buffer.plane_data.resize(frame->plane_count);
++
++  for (int i = 0; i < frame->plane_count; ++i) {
++    int plane_size = frame->line_sizes[i] * frame->height;
++    if (frame->format == kPixelFormatYUV420P && i > 0) {
++      plane_size = frame->line_sizes[i] * (frame->height / 2);
++    }
++    buffer.plane_data[i].resize(plane_size);
++    memcpy(buffer.plane_data[i].data(), frame->planes[i], plane_size);
++    buffer.frame.planes[i] = buffer.plane_data[i].data();
++  }
++
++  int64_t handle = pool->next_video_handle++;
++  pool->video_handle_to_index[slot] = handle;
++  return handle;
++}
++
++int64_t cast_frame_pool_copy_audio(CastFrameBufferPool* pool,
++                                   const CastAudioFrame* frame) {
++  if (!pool || !frame) {
++    return -1;
++  }
++
++  std::lock_guard<std::mutex> lock(pool->mutex);
++
++  int slot = -1;
++  for (size_t i = 0; i < pool->audio_frames.size(); ++i) {
++    if (!pool->audio_frames[i].in_use) {
++      slot = static_cast<int>(i);
++      break;
++    }
++  }
++
++  if (slot < 0) {
++    return -1;
++  }
++
++  auto& buffer = pool->audio_frames[slot];
++  buffer.in_use = true;
++  buffer.frame = *frame;
++  buffer.plane_data.clear();
++  buffer.plane_data.resize(frame->plane_count);
++
++  for (int i = 0; i < frame->plane_count; ++i) {
++    buffer.plane_data[i].resize(frame->plane_sizes[i]);
++    memcpy(buffer.plane_data[i].data(), frame->planes[i], frame->plane_sizes[i]);
++    buffer.frame.planes[i] = buffer.plane_data[i].data();
++  }
++
++  int64_t handle = pool->next_audio_handle++;
++  pool->audio_handle_to_index[slot] = handle;
++  return handle;
++}
++
++const CastVideoFrame* cast_frame_pool_get_video(CastFrameBufferPool* pool,
++                                                int64_t handle) {
++  if (!pool) {
++    return nullptr;
++  }
++
++  std::lock_guard<std::mutex> lock(pool->mutex);
++
++  for (size_t i = 0; i < pool->video_handle_to_index.size(); ++i) {
++    if (pool->video_handle_to_index[i] == handle && pool->video_frames[i].in_use) {
++      return &pool->video_frames[i].frame;
++    }
++  }
++  return nullptr;
++}
++
++const CastAudioFrame* cast_frame_pool_get_audio(CastFrameBufferPool* pool,
++                                                int64_t handle) {
++  if (!pool) {
++    return nullptr;
++  }
++
++  std::lock_guard<std::mutex> lock(pool->mutex);
++
++  for (size_t i = 0; i < pool->audio_handle_to_index.size(); ++i) {
++    if (pool->audio_handle_to_index[i] == handle && pool->audio_frames[i].in_use) {
++      return &pool->audio_frames[i].frame;
++    }
++  }
++  return nullptr;
++}
++
++void cast_frame_pool_release_video(CastFrameBufferPool* pool, int64_t handle) {
++  if (!pool) {
++    return;
++  }
++
++  std::lock_guard<std::mutex> lock(pool->mutex);
++
++  for (size_t i = 0; i < pool->video_handle_to_index.size(); ++i) {
++    if (pool->video_handle_to_index[i] == handle) {
++      pool->video_frames[i].in_use = false;
++      pool->video_frames[i].plane_data.clear();
++      pool->video_handle_to_index[i] = -1;
++      break;
++    }
++  }
++}
++
++void cast_frame_pool_release_audio(CastFrameBufferPool* pool, int64_t handle) {
++  if (!pool) {
++    return;
++  }
++
++  std::lock_guard<std::mutex> lock(pool->mutex);
++
++  for (size_t i = 0; i < pool->audio_handle_to_index.size(); ++i) {
++    if (pool->audio_handle_to_index[i] == handle) {
++      pool->audio_frames[i].in_use = false;
++      pool->audio_frames[i].plane_data.clear();
++      pool->audio_handle_to_index[i] = -1;
++      break;
++    }
++  }
++}
++
++}  // extern "C"
+diff --git a/cast/standalone_receiver/my_lib.h b/cast/standalone_receiver/my_lib.h
+new file mode 100644
+index 00000000..3ffa2e29
+--- /dev/null
++++ b/cast/standalone_receiver/my_lib.h
+@@ -0,0 +1,246 @@
++// Copyright 2024 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CAST_STANDALONE_RECEIVER_MY_LIB_H_
++#define CAST_STANDALONE_RECEIVER_MY_LIB_H_
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Opaque handle to the receiver instance
++typedef struct CastReceiver CastReceiver;
++
++// Pixel format for video frames
++typedef enum {
++  kPixelFormatUnknown = 0,
++  kPixelFormatYUV420P,   // Planar YUV 4:2:0 (most common from FFmpeg)
++  kPixelFormatNV12,      // Semi-planar YUV 4:2:0 (Y plane + interleaved UV)
++  kPixelFormatRGBA,      // 32-bit RGBA
++  kPixelFormatBGRA,      // 32-bit BGRA
++} CastPixelFormat;
++
++// Audio sample format
++typedef enum {
++  kAudioFormatUnknown = 0,
++  kAudioFormatS16,       // Signed 16-bit integer
++  kAudioFormatS32,       // Signed 32-bit integer
++  kAudioFormatFloat,     // 32-bit float
++  kAudioFormatPlanarS16, // Planar signed 16-bit integer
++  kAudioFormatPlanarFloat, // Planar 32-bit float
++} CastAudioFormat;
++
++// Video frame data structure
++// For YUV420P: planes[0]=Y, planes[1]=U, planes[2]=V
++// For NV12: planes[0]=Y, planes[1]=UV interleaved
++// For RGBA/BGRA: planes[0]=pixel data
++typedef struct {
++  int width;
++  int height;
++  CastPixelFormat format;
++  
++  // Plane data pointers (up to 4 planes for various formats)
++  const uint8_t* planes[4];
++  // Line sizes (strides) for each plane in bytes
++  int line_sizes[4];
++  int plane_count;
++  
++  // Presentation timestamp in microseconds
++  int64_t pts_us;
++  
++  // Frame duration in microseconds (0 if unknown)
++  int64_t duration_us;
++} CastVideoFrame;
++
++// Audio frame data structure
++typedef struct {
++  CastAudioFormat format;
++  int sample_rate;
++  int channels;
++  int samples_per_channel;
++  
++  // For interleaved formats: planes[0] contains all data
++  // For planar formats: planes[i] contains channel i data
++  const uint8_t* planes[8];
++  int plane_count;
++  
++  // Size of each plane in bytes
++  int plane_sizes[8];
++  
++  // Presentation timestamp in microseconds
++  int64_t pts_us;
++  
++  // Duration in microseconds
++  int64_t duration_us;
++} CastAudioFrame;
++
++// Window configuration for the receiver
++typedef struct {
++  int width;
++  int height;
++  const char* title;
++} CastWindowConfig;
++
++// Receiver configuration
++typedef struct {
++  // Network interface name to bind to (e.g., "en0", "eth0")
++  const char* interface_name;
++  
++  // Path to PEM file containing developer TLS certificate
++  const char* certificate_path;
++  
++  // Path to OpenSSL-generated private key for TLS
++  const char* private_key_path;
++  
++  // Friendly name for discovery (shown to senders)
++  const char* friendly_name;
++  
++  // Model name for discovery
++  const char* model_name;
++  
++  // Whether to enable mDNS/DNS-SD discovery
++  bool enable_discovery;
++  
++  // Whether to enable DSCP packet prioritization
++  bool enable_dscp;
++} CastReceiverConfig;
++
++// Callback function types
++// Note: All callbacks are called from the receiver's internal thread.
++// The caller should not block for long periods in these callbacks.
++// Frame data is only valid for the duration of the callback.
++
++// Called when a streaming session starts and a window should be opened
++typedef void (*CastOnWindowOpenCallback)(void* user_data,
++                                         const CastWindowConfig* config);
++
++// Called when the streaming session ends and the window should be closed
++typedef void (*CastOnWindowCloseCallback)(void* user_data);
++
++// Called when the window should be resized (during active session)
++typedef void (*CastOnWindowResizeCallback)(void* user_data,
++                                           int width,
++                                           int height);
++
++// Called when a new video frame is available for rendering
++// The frame data is only valid during this callback
++typedef void (*CastOnVideoFrameCallback)(void* user_data,
++                                         const CastVideoFrame* frame);
++
++// Called when new audio data is available for playback
++// The audio data is only valid during this callback
++typedef void (*CastOnAudioFrameCallback)(void* user_data,
++                                         const CastAudioFrame* frame);
++
++// Called when an error occurs
++typedef void (*CastOnErrorCallback)(void* user_data,
++                                    int error_code,
++                                    const char* error_message);
++
++// Callbacks structure to be provided by the client
++typedef struct {
++  void* user_data;
++  
++  CastOnWindowOpenCallback on_window_open;
++  CastOnWindowCloseCallback on_window_close;
++  CastOnWindowResizeCallback on_window_resize;
++  CastOnVideoFrameCallback on_video_frame;
++  CastOnAudioFrameCallback on_audio_frame;
++  CastOnErrorCallback on_error;
++} CastReceiverCallbacks;
++
++// ============================================================================
++// API Functions
++// ============================================================================
++
++// Creates a new receiver instance with the given configuration and callbacks.
++// Returns NULL on failure.
++// The receiver runs on a separate internal thread.
++__attribute__((visibility("default")))
++CastReceiver* cast_receiver_create(const CastReceiverConfig* config,
++                                   const CastReceiverCallbacks* callbacks);
++
++// Starts the receiver. This will begin listening for Cast connections.
++// Returns 0 on success, non-zero on failure.
++__attribute__((visibility("default")))
++int cast_receiver_start(CastReceiver* receiver);
++
++// Stops the receiver gracefully.
++// This will end any active streaming session and stop listening for connections.
++// Returns 0 on success, non-zero on failure.
++__attribute__((visibility("default")))
++int cast_receiver_stop(CastReceiver* receiver);
++
++// Destroys the receiver instance and frees all resources.
++// If the receiver is still running, it will be stopped first.
++__attribute__((visibility("default")))
++void cast_receiver_destroy(CastReceiver* receiver);
++
++// Checks if the receiver is currently running.
++__attribute__((visibility("default")))
++bool cast_receiver_is_running(const CastReceiver* receiver);
++
++// Checks if there is an active streaming session.
++__attribute__((visibility("default")))
++bool cast_receiver_has_active_session(const CastReceiver* receiver);
++
++// ============================================================================
++// Frame Buffer Pool (Optional - for efficient rendering)
++// ============================================================================
++
++// Opaque handle to a frame buffer pool
++typedef struct CastFrameBufferPool CastFrameBufferPool;
++
++// Creates a frame buffer pool for efficient frame copying
++// This is useful when you need to keep frame data beyond the callback lifetime
++__attribute__((visibility("default")))
++CastFrameBufferPool* cast_frame_pool_create(int max_video_frames,
++                                            int max_audio_frames);
++
++// Destroys the frame buffer pool
++__attribute__((visibility("default")))
++void cast_frame_pool_destroy(CastFrameBufferPool* pool);
++
++// Copies a video frame into the pool, returning a handle.
++// Returns -1 on failure (pool full or allocation error).
++// The returned handle can be used to retrieve the frame later.
++__attribute__((visibility("default")))
++int64_t cast_frame_pool_copy_video(CastFrameBufferPool* pool,
++                                   const CastVideoFrame* frame);
++
++// Copies an audio frame into the pool, returning a handle.
++// Returns -1 on failure (pool full or allocation error).
++__attribute__((visibility("default")))
++int64_t cast_frame_pool_copy_audio(CastFrameBufferPool* pool,
++                                   const CastAudioFrame* frame);
++
++// Gets a video frame from the pool by handle.
++// Returns NULL if the handle is invalid or the frame was already released.
++__attribute__((visibility("default")))
++const CastVideoFrame* cast_frame_pool_get_video(CastFrameBufferPool* pool,
++                                                int64_t handle);
++
++// Gets an audio frame from the pool by handle.
++// Returns NULL if the handle is invalid or the frame was already released.
++__attribute__((visibility("default")))
++const CastAudioFrame* cast_frame_pool_get_audio(CastFrameBufferPool* pool,
++                                                int64_t handle);
++
++// Releases a video frame back to the pool.
++__attribute__((visibility("default")))
++void cast_frame_pool_release_video(CastFrameBufferPool* pool, int64_t handle);
++
++// Releases an audio frame back to the pool.
++__attribute__((visibility("default")))
++void cast_frame_pool_release_audio(CastFrameBufferPool* pool, int64_t handle);
++
++#ifdef __cplusplus
++}  // extern "C"
++#endif
++
++#endif  // CAST_STANDALONE_RECEIVER_MY_LIB_H_
+diff --git a/cast/standalone_sender/my_lib.cc b/cast/standalone_sender/my_lib.cc
+index 29751036..e84fc28a 100644
+--- a/cast/standalone_sender/my_lib.cc
++++ b/cast/standalone_sender/my_lib.cc
+@@ -1,4 +1,1009 @@
+-extern "C" __attribute__((visibility("default"))) int todo(int argc,
+-                                                            char* argv[]) {
++// Copyright 2024 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "cast/standalone_sender/my_lib.h"
++
++#include <algorithm>
++#include <atomic>
++#include <condition_variable>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "cast/common/channel/cast_socket_message_port.h"
++#include "cast/common/channel/connection_namespace_handler.h"
++#include "cast/common/channel/message_util.h"
++#include "cast/common/channel/virtual_connection_router.h"
++#include "cast/common/public/cast_socket.h"
++#include "cast/common/public/cast_streaming_app_ids.h"
++#include "cast/common/public/receiver_info.h"
++#include "cast/common/public/trust_store.h"
++#include "cast/sender/public/sender_socket_factory.h"
++#include "cast/streaming/public/capture_recommendations.h"
++#include "cast/streaming/public/constants.h"
++#include "cast/streaming/public/environment.h"
++#include "cast/streaming/public/offer_messages.h"
++#include "cast/streaming/public/sender.h"
++#include "cast/streaming/public/sender_session.h"
++#include "discovery/common/config.h"
++#include "discovery/common/reporting_client.h"
++#include "discovery/public/dns_sd_service_factory.h"
++#include "discovery/public/dns_sd_service_watcher.h"
++#include "json/value.h"
++#include "platform/api/network_interface.h"
++#include "platform/api/task_runner_deleter.h"
++#include "platform/api/time.h"
++#include "platform/api/tls_connection_factory.h"
++#include "platform/base/interface_info.h"
++#include "platform/impl/network_interface.h"
++#include "platform/impl/platform_client_posix.h"
++#include "platform/impl/task_runner.h"
++#include "util/chrono_helpers.h"
++#include "util/json/json_helpers.h"
++#include "util/osp_logging.h"
++
++#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++#include "cast/standalone_sender/streaming_opus_encoder.h"
++#include "cast/standalone_sender/streaming_video_encoder.h"
++#include "cast/standalone_sender/streaming_vpx_encoder.h"
++#if defined(CAST_STANDALONE_SENDER_HAVE_LIBAOM)
++#include "cast/standalone_sender/streaming_av1_encoder.h"
++#endif
++#endif
++
++namespace openscreen::cast {
++namespace {
++
++constexpr int kDefaultMaxBitrate = 5000000;
++constexpr int kDefaultAudioSampleRate = 48000;
++constexpr int kDefaultAudioChannels = 2;
++
++VideoCodec ToInternalVideoCodec(SenderVideoCodec codec) {
++  switch (codec) {
++    case kSenderVideoCodecVp9:
++      return VideoCodec::kVp9;
++    case kSenderVideoCodecAv1:
++      return VideoCodec::kAv1;
++    case kSenderVideoCodecVp8:
++    default:
++      return VideoCodec::kVp8;
++  }
++}
++
++class CastSenderImpl;
++
++class ReceiverDiscovery final : public discovery::ReportingClient {
++ public:
++  ReceiverDiscovery(const InterfaceInfo& interface,
++                    TaskRunner& task_runner,
++                    CastSenderImpl* sender);
++  ~ReceiverDiscovery() final;
++
++  void Start();
++  void Stop();
++  bool IsRunning() const { return watcher_ != nullptr; }
++
++  std::vector<ReceiverInfo> GetDiscoveredReceivers() const;
++
++ private:
++  void OnFatalError(const Error& error) final;
++  void OnRecoverableError(const Error& error) final;
++
++  void OnDnsWatcherUpdate(
++      std::vector<std::reference_wrapper<const ReceiverInfo>> all);
++
++  CastSenderImpl* sender_;
++  TaskRunner& task_runner_;
++  InterfaceInfo interface_;
++  discovery::DnsSdServicePtr service_;
++  std::unique_ptr<discovery::DnsSdServiceWatcher<ReceiverInfo>> watcher_;
++  mutable std::mutex receivers_mutex_;
++  std::vector<ReceiverInfo> discovered_receivers_;
++};
++
++class CastSenderImpl final
++    : public SenderSocketFactory::Client,
++      public VirtualConnectionRouter::SocketErrorHandler,
++      public ConnectionNamespaceHandler::VirtualConnectionPolicy,
++      public CastMessageHandler,
++      public SenderSession::Client {
++ public:
++  CastSenderImpl(const CastSenderConfig& config,
++                 const CastSenderCallbacks& callbacks);
++  ~CastSenderImpl();
++
++  int StartDiscovery();
++  void StopDiscovery();
++  bool IsDiscovering() const;
++
++  std::vector<ReceiverInfo> GetDiscoveredReceivers() const;
++  int Connect(const std::string& receiver_unique_id);
++  int ConnectToIP(const std::string& ip_address, uint16_t port);
++  void Disconnect();
++  bool IsConnected() const;
++
++  int SendVideoFrame(const SenderVideoFrame& frame);
++  int SendAudioSamples(const SenderAudioSamples& samples);
++  void SetVideoBitrate(int bitrate_bps);
++  int GetNetworkBandwidth() const;
++
++  void NotifyReceiverDiscovered(const ReceiverInfo& receiver);
++  void NotifyReceiverLost(const std::string& unique_id);
++
++ private:
++  void OnConnected(SenderSocketFactory* factory,
++                   const IPEndpoint& endpoint,
++                   std::unique_ptr<CastSocket> socket) override;
++  void OnError(SenderSocketFactory* factory,
++               const IPEndpoint& endpoint,
++               const Error& error) override;
++
++  void OnClose(CastSocket* cast_socket) override;
++  void OnError(CastSocket* socket, const Error& error) override;
++
++  bool IsConnectionAllowed(const VirtualConnection& virtual_conn) const override;
++
++  void OnMessage(VirtualConnectionRouter* router,
++                 CastSocket* socket,
++                 proto::CastMessage message) override;
++
++  void OnNegotiated(const SenderSession* session,
++                    SenderSession::ConfiguredSenders senders,
++                    capture_recommendations::Recommendations recommendations) override;
++  void OnError(const SenderSession* session, const Error& error) override;
++
++  void HandleReceiverStatus(const Json::Value& status);
++  void OnRemoteMessagingOpened(bool success);
++  void OnReceiverMessagingOpened(bool success);
++  void CreateAndStartSession();
++  void Shutdown();
++
++  void RunThread();
++
++  CastSenderConfig config_;
++  CastSenderCallbacks callbacks_;
++
++  std::unique_ptr<std::thread> sender_thread_;
++  std::atomic<bool> running_{false};
++  std::atomic<bool> connected_{false};
++  std::atomic<bool> discovering_{false};
++
++  TaskRunnerImpl* task_runner_ = nullptr;
++  std::unique_ptr<ReceiverDiscovery> discovery_;
++  InterfaceInfo interface_info_;
++
++  std::unique_ptr<TrustStore> trust_store_;
++  VirtualConnectionRouter router_;
++  ConnectionNamespaceHandler connection_handler_{router_, *this};
++  std::unique_ptr<SenderSocketFactory> socket_factory_;
++  std::unique_ptr<TlsConnectionFactory> connection_factory_;
++  CastSocketMessagePort message_port_{router_};
++
++  int next_request_id_ = 1;
++  std::string app_session_id_;
++  std::optional<VirtualConnection> remote_connection_;
++  std::optional<VirtualConnection> platform_remote_connection_;
++
++  std::unique_ptr<Environment> environment_;
++  std::unique_ptr<SenderSession> current_session_;
++
++  IPEndpoint pending_endpoint_;
++  bool has_launched_ = false;
++
++#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++  std::unique_ptr<StreamingVideoEncoder> video_encoder_;
++  std::unique_ptr<StreamingOpusEncoder> audio_encoder_;
++#endif
++};
++
++ReceiverDiscovery::ReceiverDiscovery(const InterfaceInfo& interface,
++                                     TaskRunner& task_runner,
++                                     CastSenderImpl* sender)
++    : sender_(sender), task_runner_(task_runner), interface_(interface) {}
++
++ReceiverDiscovery::~ReceiverDiscovery() {
++  Stop();
++}
++
++void ReceiverDiscovery::Start() {
++  if (watcher_) return;
++
++  discovery::Config config;
++  config.network_info = {interface_};
++  
++  OSP_LOG_INFO << "Starting discovery on interface: " << interface_.name << " (index: " << interface_.index << ")";
++
++  service_ = discovery::CreateDnsSdService(task_runner_, *this, config);
++  if (!service_) {
++    OSP_LOG_ERROR << "Failed to create DNS-SD service for discovery.";
++    return;
++  }
++
++  // Check that the querier is available before creating the watcher
++  auto* querier = service_->GetQuerier();
++  if (!querier) {
++    OSP_LOG_ERROR << "DNS-SD service has no querier available.";
++    service_.reset();
++    return;
++  }
++
++  watcher_ = std::make_unique<discovery::DnsSdServiceWatcher<ReceiverInfo>>(
++      service_.get(), kCastV2ServiceId, DnsSdInstanceEndpointToReceiverInfo,
++      [this](auto all) { OnDnsWatcherUpdate(std::move(all)); });
++
++  watcher_->StartDiscovery();
++}
++
++void ReceiverDiscovery::Stop() {
++  if (watcher_) {
++    watcher_->StopDiscovery();
++    watcher_.reset();
++  }
++  service_.reset();
++}
++
++std::vector<ReceiverInfo> ReceiverDiscovery::GetDiscoveredReceivers() const {
++  std::lock_guard<std::mutex> lock(receivers_mutex_);
++  return discovered_receivers_;
++}
++
++void ReceiverDiscovery::OnFatalError(const Error& error) {
++  OSP_LOG_ERROR << "Fatal discovery error: " << error;
++}
++
++void ReceiverDiscovery::OnRecoverableError(const Error& error) {
++  OSP_LOG_WARN << "Recoverable discovery error: " << error;
++}
++
++void ReceiverDiscovery::OnDnsWatcherUpdate(
++    std::vector<std::reference_wrapper<const ReceiverInfo>> all) {
++  std::vector<std::string> old_ids;
++  {
++    std::lock_guard<std::mutex> lock(receivers_mutex_);
++    for (const auto& r : discovered_receivers_) {
++      old_ids.push_back(r.unique_id);
++    }
++    discovered_receivers_.clear();
++    for (const auto& ref : all) {
++      discovered_receivers_.push_back(ref.get());
++    }
++  }
++
++  std::vector<std::string> new_ids;
++  for (const auto& ref : all) {
++    new_ids.push_back(ref.get().unique_id);
++    if (std::find(old_ids.begin(), old_ids.end(), ref.get().unique_id) ==
++        old_ids.end()) {
++      sender_->NotifyReceiverDiscovered(ref.get());
++    }
++  }
++
++  for (const auto& old_id : old_ids) {
++    if (std::find(new_ids.begin(), new_ids.end(), old_id) == new_ids.end()) {
++      sender_->NotifyReceiverLost(old_id);
++    }
++  }
++}
++
++CastSenderImpl::CastSenderImpl(const CastSenderConfig& config,
++                               const CastSenderCallbacks& callbacks)
++    : config_(config), callbacks_(callbacks) {
++  router_.AddHandlerForLocalId(kPlatformSenderId, this);
++}
++
++CastSenderImpl::~CastSenderImpl() {
++  Shutdown();
++  if (sender_thread_ && sender_thread_->joinable()) {
++    sender_thread_->join();
++  }
++}
++
++void CastSenderImpl::RunThread() {
++  if (config_.developer_certificate_path &&
++      strlen(config_.developer_certificate_path) > 0) {
++    trust_store_ = TrustStore::CreateInstanceFromPemFile(
++        config_.developer_certificate_path);
++  }
++  if (!trust_store_) {
++    trust_store_ = CastTrustStore::Create();
++  }
++
++  auto* task_runner_ptr = new TaskRunnerImpl(&Clock::now);
++  task_runner_ = task_runner_ptr;
++  PlatformClientPosix::Create(milliseconds(50),
++                              std::unique_ptr<TaskRunnerImpl>(task_runner_ptr));
++
++  if (config_.interface_name && strlen(config_.interface_name) > 0) {
++    OSP_LOG_INFO << "Looking for interface: " << config_.interface_name;
++    for (const auto& iface : GetNetworkInterfaces()) {
++      OSP_LOG_INFO << "Found interface: " << iface.name << " (index: " << iface.index << ")";
++      if (iface.name == config_.interface_name) {
++        interface_info_ = iface;
++        break;
++      }
++    }
++  }
++
++  // If no specific interface was found/requested, pick the first active one
++  if (interface_info_.name.empty()) {
++    OSP_LOG_INFO << "No specific interface found/requested. searching for default...";
++    auto interfaces = GetNetworkInterfaces();
++    for (const auto& iface : interfaces) {
++      OSP_LOG_INFO << "Found interface: " << iface.name << " (index: " << iface.index << ")";
++      // Prefer non-loopback interfaces with valid addresses
++      if (!iface.name.empty() && iface.name != "lo" && iface.name != "lo0") {
++        interface_info_ = iface;
++        OSP_LOG_INFO << "Auto-selected network interface: " << iface.name;
++        break;
++      }
++    }
++  }
++
++  if (interface_info_.name.empty()) {
++     OSP_LOG_ERROR << "Failed to find any usable network interface.";
++  } else {
++     OSP_LOG_INFO << "Using interface: " << interface_info_.name << " index: " << interface_info_.index;
++  }
++
++  socket_factory_ = std::make_unique<SenderSocketFactory>(
++      *this, *task_runner_, std::move(trust_store_), CastCRLTrustStore::Create());
++  connection_factory_ =
++      TlsConnectionFactory::CreateFactory(*socket_factory_, *task_runner_);
++  socket_factory_->set_factory(connection_factory_.get());
++
++  running_.store(true);
++
++  task_runner_->RunUntilSignaled();
++
++  OSP_LOG_INFO << "Shutting down sender...";
++  task_runner_->PostTask([this, task_runner_ptr]() {
++    Shutdown();
++    task_runner_ptr->RequestStopSoon();
++  });
++  task_runner_->RunUntilStopped();
++
++  PlatformClientPosix::ShutDown();
++  running_.store(false);
++  task_runner_ = nullptr;
++}
++
++int CastSenderImpl::StartDiscovery() {
++  if (!task_runner_) {
++    sender_thread_ = std::make_unique<std::thread>([this]() { RunThread(); });
++    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++  }
++
++  if (!task_runner_ || interface_info_.name.empty()) {
++    return -1;
++  }
++
++  task_runner_->PostTask([this]() {
++    discovery_ =
++        std::make_unique<ReceiverDiscovery>(interface_info_, *task_runner_, this);
++    discovery_->Start();
++    discovering_.store(true);
++  });
++
++  return 0;
++}
++
++void CastSenderImpl::StopDiscovery() {
++  if (task_runner_ && discovery_) {
++    task_runner_->PostTask([this]() {
++      discovery_->Stop();
++      discovering_.store(false);
++    });
++  }
++}
++
++bool CastSenderImpl::IsDiscovering() const {
++  return discovering_.load();
++}
++
++std::vector<ReceiverInfo> CastSenderImpl::GetDiscoveredReceivers() const {
++  if (discovery_) {
++    return discovery_->GetDiscoveredReceivers();
++  }
++  return {};
++}
++
++int CastSenderImpl::Connect(const std::string& receiver_unique_id) {
++  auto receivers = GetDiscoveredReceivers();
++  for (const auto& r : receivers) {
++    if (r.unique_id == receiver_unique_id) {
++      std::ostringstream oss;
++      if (r.v4_address) {
++        oss << r.v4_address;
++        return ConnectToIP(oss.str(), r.port);
++      } else if (r.v6_address) {
++        oss << r.v6_address;
++        return ConnectToIP(oss.str(), r.port);
++      }
++      return -1;
++    }
++  }
++  return -1;
++}
++
++int CastSenderImpl::ConnectToIP(const std::string& ip_address, uint16_t port) {
++  if (!task_runner_) {
++    sender_thread_ = std::make_unique<std::thread>([this]() { RunThread(); });
++    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++  }
++
++  if (!task_runner_) {
++    return -1;
++  }
++
++  auto parsed = IPAddress::Parse(ip_address);
++  if (!parsed.is_value()) {
++    return -1;
++  }
++
++  pending_endpoint_ = IPEndpoint{parsed.value(), port};
++
++  task_runner_->PostTask([this]() {
++    auto policy = SenderSocketFactory::DeviceMediaPolicy::kIncludesVideo;
++    socket_factory_->Connect(pending_endpoint_, policy, &router_);
++  });
++
++  return 0;
++}
++
++void CastSenderImpl::Disconnect() {
++  if (task_runner_) {
++    task_runner_->PostTask([this]() { Shutdown(); });
++  }
++}
++
++bool CastSenderImpl::IsConnected() const {
++  return connected_.load();
++}
++
++void CastSenderImpl::NotifyReceiverDiscovered(const ReceiverInfo& receiver) {
++  if (callbacks_.on_receiver_discovered) {
++    SenderDiscoveredReceiver info = {};
++    strncpy(info.friendly_name, receiver.friendly_name.c_str(),
++            sizeof(info.friendly_name) - 1);
++    strncpy(info.unique_id, receiver.unique_id.c_str(),
++            sizeof(info.unique_id) - 1);
++
++    std::ostringstream oss;
++    if (receiver.v4_address) {
++      oss << receiver.v4_address;
++      strncpy(info.ip_address, oss.str().c_str(), sizeof(info.ip_address) - 1);
++      info.port = receiver.port;
++    } else if (receiver.v6_address) {
++      oss << receiver.v6_address;
++      strncpy(info.ip_address, oss.str().c_str(), sizeof(info.ip_address) - 1);
++      info.port = receiver.port;
++    }
++
++    info.has_video_output = (receiver.capabilities & kHasVideoOutput) != 0;
++    info.has_audio_output = (receiver.capabilities & kHasAudioOutput) != 0;
++
++    callbacks_.on_receiver_discovered(callbacks_.user_data, &info);
++  }
++}
++
++void CastSenderImpl::NotifyReceiverLost(const std::string& unique_id) {
++  if (callbacks_.on_receiver_lost) {
++    callbacks_.on_receiver_lost(callbacks_.user_data, unique_id.c_str());
++  }
++}
++
++void CastSenderImpl::OnConnected(SenderSocketFactory* factory,
++                                 const IPEndpoint& endpoint,
++                                 std::unique_ptr<CastSocket> socket) {
++  if (message_port_.GetSocketId() != ToCastSocketId(nullptr)) {
++    OSP_LOG_WARN << "Already connected, dropping peer at: " << endpoint;
++    return;
++  }
++
++  message_port_.SetSocket(socket->GetWeakPtr());
++  router_.TakeSocket(this, std::move(socket));
++
++  OSP_LOG_INFO << "Launching Mirroring App on the Cast Receiver...";
++  platform_remote_connection_.emplace(VirtualConnection{
++      kPlatformSenderId, kPlatformReceiverId, message_port_.GetSocketId()});
++  connection_handler_.OpenRemoteConnection(
++      *platform_remote_connection_,
++      [this](bool success) { OnReceiverMessagingOpened(success); });
++}
++
++void CastSenderImpl::OnError(SenderSocketFactory* factory,
++                             const IPEndpoint& endpoint,
++                             const Error& error) {
++  OSP_LOG_ERROR << "Socket factory error: " << error;
++  if (callbacks_.on_error) {
++    callbacks_.on_error(callbacks_.user_data, static_cast<int>(error.code()),
++                        error.message().c_str());
++  }
++  Shutdown();
++}
++
++void CastSenderImpl::OnClose(CastSocket* cast_socket) {
++  OSP_LOG_INFO << "Socket closed.";
++  connected_.store(false);
++  if (callbacks_.on_disconnected) {
++    callbacks_.on_disconnected(callbacks_.user_data);
++  }
++  Shutdown();
++}
++
++void CastSenderImpl::OnError(CastSocket* socket, const Error& error) {
++  OSP_LOG_ERROR << "Socket error: " << error;
++  if (callbacks_.on_error) {
++    callbacks_.on_error(callbacks_.user_data, static_cast<int>(error.code()),
++                        error.message().c_str());
++  }
++  Shutdown();
++}
++
++bool CastSenderImpl::IsConnectionAllowed(
++    const VirtualConnection& virtual_conn) const {
++  return true;
++}
++
++void CastSenderImpl::OnMessage(VirtualConnectionRouter* router,
++                               CastSocket* socket,
++                               proto::CastMessage message) {
++  if (message_port_.GetSocketId() == ToCastSocketId(socket) &&
++      !message_port_.source_id().empty() &&
++      message_port_.source_id() == message.destination_id()) {
++    message_port_.OnMessage(router, socket, std::move(message));
++    return;
++  }
++
++  if (message.destination_id() != kPlatformSenderId &&
++      message.destination_id() != kBroadcastId) {
++    return;
++  }
++
++  if (message.namespace_() == kReceiverNamespace &&
++      message_port_.GetSocketId() == ToCastSocketId(socket)) {
++    const ErrorOr<Json::Value> payload = json::Parse(GetPayload(message));
++    if (payload.is_error()) {
++      return;
++    }
++
++    if (HasType(payload.value(), CastMessageType::kReceiverStatus)) {
++      HandleReceiverStatus(payload.value());
++    } else if (HasType(payload.value(), CastMessageType::kLaunchError)) {
++      OSP_LOG_ERROR << "Failed to launch mirroring app.";
++      if (callbacks_.on_error) {
++        callbacks_.on_error(callbacks_.user_data, -1,
++                            "Failed to launch mirroring app");
++      }
++      Shutdown();
++    }
++  }
++}
++
++void CastSenderImpl::HandleReceiverStatus(const Json::Value& status) {
++  const Json::Value& app_list = status["status"]["applications"];
++  if (!app_list.isArray() || app_list.empty()) {
++    if (has_launched_) {
++      OSP_LOG_INFO << "Mirroring app stopped.";
++      Shutdown();
++    }
++    return;
++  }
++
++  for (const Json::Value& app_value : app_list) {
++    std::string app_id;
++    std::string session_id;
++    if (json::TryParseString(app_value["appId"], &app_id) &&
++        json::TryParseString(app_value["sessionId"], &session_id) &&
++        IsCastStreamingReceiverAppId(app_id)) {
++      if (app_session_id_.empty()) {
++        app_session_id_ = session_id;
++        has_launched_ = true;
++
++        std::string destination_id;
++        if (json::TryParseString(app_value["transportId"], &destination_id)) {
++          remote_connection_.emplace(VirtualConnection{
++              kPlatformSenderId, destination_id, message_port_.GetSocketId()});
++          connection_handler_.OpenRemoteConnection(
++              *remote_connection_,
++              [this](bool success) { OnRemoteMessagingOpened(success); });
++        }
++      }
++      return;
++    }
++  }
++}
++
++void CastSenderImpl::OnReceiverMessagingOpened(bool success) {
++  if (!success) {
++    OSP_LOG_ERROR << "Failed to open receiver messaging.";
++    Shutdown();
++    return;
++  }
++
++  const char* app_id = GetCastStreamingAudioVideoAppId();
++
++  Json::Value launch_request;
++  launch_request["type"] = CastMessageTypeToString(CastMessageType::kLaunch);
++  launch_request["requestId"] = next_request_id_++;
++  launch_request["appId"] = app_id;
++
++  auto json_result = json::Stringify(launch_request);
++  if (json_result.is_value()) {
++    router_.Send(
++        *platform_remote_connection_,
++        MakeSimpleUTF8Message(kReceiverNamespace, json_result.value()));
++  }
++}
++
++void CastSenderImpl::OnRemoteMessagingOpened(bool success) {
++  if (!success) {
++    OSP_LOG_ERROR << "Failed to open remote messaging.";
++    Shutdown();
++    return;
++  }
++
++  CreateAndStartSession();
++}
++
++void CastSenderImpl::CreateAndStartSession() {
++  environment_ = std::make_unique<Environment>(
++      &Clock::now, *task_runner_,
++      IPEndpoint{pending_endpoint_.address, kDefaultCastStreamingPort});
++
++  SenderSession::Configuration session_config{
++      .remote_address = pending_endpoint_.address,
++      .client = *this,
++      .environment = environment_.get(),
++      .message_port = &message_port_,
++      .message_source_id = message_port_.source_id(),
++      .message_destination_id = remote_connection_->peer_id,
++      .use_android_rtp_hack = config_.use_android_rtp_hack,
++      .enable_dscp = config_.enable_dscp};
++
++  current_session_ = std::make_unique<SenderSession>(std::move(session_config));
++
++  std::vector<AudioCaptureConfig> audio_configs;
++  AudioCaptureConfig audio_config;
++  audio_config.codec = AudioCodec::kOpus;
++  audio_config.channels = config_.audio_channels > 0 ? config_.audio_channels
++                                                     : kDefaultAudioChannels;
++  audio_config.sample_rate = config_.audio_sample_rate > 0
++                                 ? config_.audio_sample_rate
++                                 : kDefaultAudioSampleRate;
++  audio_config.bit_rate = 128000;
++  audio_configs.push_back(audio_config);
++
++  std::vector<VideoCaptureConfig> video_configs;
++  VideoCaptureConfig video_config;
++  video_config.codec = ToInternalVideoCodec(config_.video_codec);
++  video_config.max_bit_rate =
++      config_.max_video_bitrate > 0 ? config_.max_video_bitrate : kDefaultMaxBitrate;
++  video_config.max_frame_rate = {30, 1};
++  video_config.resolutions.push_back(
++      {config_.video_width > 0 ? config_.video_width : 1920,
++       config_.video_height > 0 ? config_.video_height : 1080});
++  video_configs.push_back(video_config);
++
++  Error result = current_session_->Negotiate(audio_configs, video_configs);
++  if (!result.ok()) {
++    OSP_LOG_ERROR << "Negotiation error: " << result;
++    if (callbacks_.on_error) {
++      callbacks_.on_error(callbacks_.user_data, static_cast<int>(result.code()),
++                          result.message().c_str());
++    }
++  }
++}
++
++void CastSenderImpl::OnNegotiated(
++    const SenderSession* session,
++    SenderSession::ConfiguredSenders senders,
++    capture_recommendations::Recommendations recommendations) {
++  OSP_LOG_INFO << "Session negotiated successfully.";
++
++  connected_.store(true);
++  if (callbacks_.on_connected) {
++    callbacks_.on_connected(callbacks_.user_data);
++  }
++
++#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++  if (senders.video_sender) {
++    StreamingVideoEncoder::Parameters params;
++    params.codec = ToInternalVideoCodec(config_.video_codec);
++
++    switch (config_.video_codec) {
++#if defined(CAST_STANDALONE_SENDER_HAVE_LIBAOM)
++      case kSenderVideoCodecAv1:
++        video_encoder_ = std::make_unique<StreamingAv1Encoder>(
++            params, *task_runner_, std::move(senders.video_sender));
++        break;
++#endif
++      case kSenderVideoCodecVp9:
++      case kSenderVideoCodecVp8:
++      default:
++        video_encoder_ = std::make_unique<StreamingVpxEncoder>(
++            params, *task_runner_, std::move(senders.video_sender));
++        break;
++    }
++
++    int bitrate = config_.max_video_bitrate > 0 ? config_.max_video_bitrate
++                                                 : kDefaultMaxBitrate;
++    video_encoder_->SetTargetBitrate(bitrate);
++  }
++
++  if (senders.audio_sender) {
++    int channels = config_.audio_channels > 0 ? config_.audio_channels
++                                               : kDefaultAudioChannels;
++    audio_encoder_ = std::make_unique<StreamingOpusEncoder>(
++        channels, StreamingOpusEncoder::kDefaultCastAudioFramesPerSecond,
++        std::move(senders.audio_sender));
++  }
++#endif
++}
++
++void CastSenderImpl::OnError(const SenderSession* session, const Error& error) {
++  OSP_LOG_ERROR << "Session error: " << error;
++  if (callbacks_.on_error) {
++    callbacks_.on_error(callbacks_.user_data, static_cast<int>(error.code()),
++                        error.message().c_str());
++  }
++}
++
++int CastSenderImpl::SendVideoFrame(const SenderVideoFrame& frame) {
++#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++  if (!video_encoder_ || !connected_.load()) {
++    return -1;
++  }
++
++  StreamingVideoEncoder::VideoFrame encoder_frame;
++  encoder_frame.width = frame.width;
++  encoder_frame.height = frame.height;
++  encoder_frame.yuv_planes[0] = frame.y_plane;
++  encoder_frame.yuv_planes[1] = frame.u_plane;
++  encoder_frame.yuv_planes[2] = frame.v_plane;
++  encoder_frame.yuv_strides[0] = frame.y_stride;
++  encoder_frame.yuv_strides[1] = frame.u_stride;
++  encoder_frame.yuv_strides[2] = frame.v_stride;
++  encoder_frame.duration = std::chrono::microseconds(frame.duration_us);
++  encoder_frame.capture_begin_time =
++      Clock::time_point(std::chrono::microseconds(frame.capture_begin_time_us));
++  encoder_frame.capture_end_time =
++      Clock::time_point(std::chrono::microseconds(frame.capture_end_time_us));
++
++  Clock::time_point reference_time = Clock::now();
++
++  std::function<void(StreamingVideoEncoder::Stats)> stats_callback = nullptr;
++  if (callbacks_.on_encoder_stats) {
++    stats_callback = [this](StreamingVideoEncoder::Stats stats) {
++      CastEncoderStats c_stats = {};
++      c_stats.frame_id = stats.frame_id.value();
++      c_stats.encoded_size_bytes = stats.encoded_size;
++      c_stats.encode_time_us =
++          std::chrono::duration_cast<std::chrono::microseconds>(
++              stats.encode_wall_time)
++              .count();
++      c_stats.time_utilization = stats.time_utilization();
++      c_stats.space_utilization = stats.space_utilization();
++      c_stats.quantizer = stats.quantizer;
++      callbacks_.on_encoder_stats(callbacks_.user_data, &c_stats);
++    };
++  }
++
++  video_encoder_->EncodeAndSend(encoder_frame, reference_time, stats_callback);
+   return 0;
++#else
++  return -1;
++#endif
++}
++
++int CastSenderImpl::SendAudioSamples(const SenderAudioSamples& samples) {
++#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++  if (!audio_encoder_ || !connected_.load()) {
++    return -1;
++  }
++
++  Clock::time_point capture_begin =
++      Clock::time_point(std::chrono::microseconds(samples.capture_begin_time_us));
++  Clock::time_point capture_end =
++      Clock::time_point(std::chrono::microseconds(samples.capture_end_time_us));
++  Clock::time_point reference_time = Clock::now();
++
++  audio_encoder_->EncodeAndSend(samples.samples, samples.num_samples,
++                                capture_begin, capture_end, reference_time);
++  return 0;
++#else
++  return -1;
++#endif
++}
++
++void CastSenderImpl::SetVideoBitrate(int bitrate_bps) {
++#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++  if (video_encoder_) {
++    video_encoder_->SetTargetBitrate(bitrate_bps);
++  }
++#endif
++}
++
++int CastSenderImpl::GetNetworkBandwidth() const {
++  if (current_session_) {
++    return current_session_->GetEstimatedNetworkBandwidth();
++  }
++  return 0;
++}
++
++void CastSenderImpl::Shutdown() {
++#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++  video_encoder_.reset();
++  audio_encoder_.reset();
++#endif
++
++  current_session_.reset();
++  environment_.reset();
++
++  if (!app_session_id_.empty() && platform_remote_connection_) {
++    Json::Value stop_request;
++    stop_request["type"] = CastMessageTypeToString(CastMessageType::kStop);
++    stop_request["requestId"] = next_request_id_++;
++    stop_request["sessionId"] = app_session_id_;
++    auto json_result = json::Stringify(stop_request);
++    if (json_result.is_value()) {
++      router_.Send(*platform_remote_connection_,
++                   MakeSimpleUTF8Message(kReceiverNamespace, json_result.value()));
++    }
++  }
++
++  app_session_id_.clear();
++  remote_connection_.reset();
++  platform_remote_connection_.reset();
++  has_launched_ = false;
++  connected_.store(false);
++
++  message_port_.SetSocket(WeakPtr<CastSocket>{});
++}
++
++}  // namespace
++}  // namespace openscreen::cast
++
++struct CastSender {
++  std::unique_ptr<openscreen::cast::CastSenderImpl> impl;
++};
++
++extern "C" {
++
++CastSender* cast_sender_create(const CastSenderConfig* config,
++                               const CastSenderCallbacks* callbacks) {
++  if (!config || !callbacks) {
++    return nullptr;
++  }
++
++  auto sender = std::make_unique<CastSender>();
++  sender->impl = std::make_unique<openscreen::cast::CastSenderImpl>(*config,
++                                                                     *callbacks);
++  return sender.release();
++}
++
++int cast_sender_start_discovery(CastSender* sender) {
++  if (!sender || !sender->impl) {
++    return -1;
++  }
++  return sender->impl->StartDiscovery();
++}
++
++void cast_sender_stop_discovery(CastSender* sender) {
++  if (sender && sender->impl) {
++    sender->impl->StopDiscovery();
++  }
++}
++
++int cast_sender_get_discovered_receivers(CastSender* sender,
++                                         SenderDiscoveredReceiver* receivers,
++                                         int max_receivers) {
++  if (!sender || !sender->impl) {
++    return 0;
++  }
++
++  auto discovered = sender->impl->GetDiscoveredReceivers();
++  if (!receivers) {
++    return static_cast<int>(discovered.size());
++  }
++
++  int count = std::min(max_receivers, static_cast<int>(discovered.size()));
++  for (int i = 0; i < count; ++i) {
++    const auto& r = discovered[i];
++    memset(&receivers[i], 0, sizeof(SenderDiscoveredReceiver));
++    strncpy(receivers[i].friendly_name, r.friendly_name.c_str(),
++            sizeof(receivers[i].friendly_name) - 1);
++    strncpy(receivers[i].unique_id, r.unique_id.c_str(),
++            sizeof(receivers[i].unique_id) - 1);
++
++    std::ostringstream oss;
++    if (r.v4_address) {
++      oss << r.v4_address;
++      strncpy(receivers[i].ip_address, oss.str().c_str(),
++              sizeof(receivers[i].ip_address) - 1);
++      receivers[i].port = r.port;
++    } else if (r.v6_address) {
++      oss << r.v6_address;
++      strncpy(receivers[i].ip_address, oss.str().c_str(),
++              sizeof(receivers[i].ip_address) - 1);
++      receivers[i].port = r.port;
++    }
++
++    receivers[i].has_video_output =
++        (r.capabilities & openscreen::cast::kHasVideoOutput) != 0;
++    receivers[i].has_audio_output =
++        (r.capabilities & openscreen::cast::kHasAudioOutput) != 0;
++  }
++
++  return count;
++}
++
++int cast_sender_connect(CastSender* sender, const char* receiver_unique_id) {
++  if (!sender || !sender->impl || !receiver_unique_id) {
++    return -1;
++  }
++  return sender->impl->Connect(receiver_unique_id);
++}
++
++int cast_sender_connect_to_ip(CastSender* sender,
++                              const char* ip_address,
++                              uint16_t port) {
++  if (!sender || !sender->impl || !ip_address) {
++    return -1;
++  }
++  return sender->impl->ConnectToIP(ip_address, port);
++}
++
++void cast_sender_disconnect(CastSender* sender) {
++  if (sender && sender->impl) {
++    sender->impl->Disconnect();
++  }
++}
++
++int cast_sender_send_video_frame(CastSender* sender,
++                                 const SenderVideoFrame* frame) {
++  if (!sender || !sender->impl || !frame) {
++    return -1;
++  }
++  return sender->impl->SendVideoFrame(*frame);
++}
++
++int cast_sender_send_audio_samples(CastSender* sender,
++                                   const SenderAudioSamples* samples) {
++  if (!sender || !sender->impl || !samples) {
++    return -1;
++  }
++  return sender->impl->SendAudioSamples(*samples);
++}
++
++void cast_sender_set_video_bitrate(CastSender* sender, int bitrate_bps) {
++  if (sender && sender->impl) {
++    sender->impl->SetVideoBitrate(bitrate_bps);
++  }
++}
++
++int cast_sender_get_network_bandwidth(CastSender* sender) {
++  if (!sender || !sender->impl) {
++    return 0;
++  }
++  return sender->impl->GetNetworkBandwidth();
++}
++
++bool cast_sender_is_connected(const CastSender* sender) {
++  return sender && sender->impl && sender->impl->IsConnected();
++}
++
++bool cast_sender_is_discovering(const CastSender* sender) {
++  return sender && sender->impl && sender->impl->IsDiscovering();
++}
++
++void cast_sender_destroy(CastSender* sender) {
++  delete sender;
++}
++
+ }
+diff --git a/cast/standalone_sender/my_lib.h b/cast/standalone_sender/my_lib.h
+new file mode 100644
+index 00000000..b5005117
+--- /dev/null
++++ b/cast/standalone_sender/my_lib.h
+@@ -0,0 +1,240 @@
++// Copyright 2024 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CAST_STANDALONE_SENDER_MY_LIB_H_
++#define CAST_STANDALONE_SENDER_MY_LIB_H_
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Opaque handle to the sender instance
++typedef struct CastSender CastSender;
++
++// Video codec options
++typedef enum {
++  kSenderVideoCodecVp8 = 0,
++  kSenderVideoCodecVp9,
++  kSenderVideoCodecAv1,
++} SenderVideoCodec;
++
++// Audio codec options (currently only Opus is supported)
++typedef enum {
++  kSenderAudioCodecOpus = 0,
++} SenderAudioCodec;
++
++// Discovered Cast receiver information (for sender discovery)
++typedef struct {
++  char friendly_name[256];
++  char unique_id[64];
++  char ip_address[64];
++  uint16_t port;
++  bool has_video_output;
++  bool has_audio_output;
++} SenderDiscoveredReceiver;
++
++// Video frame to be sent (YUV420P format)
++typedef struct {
++  int width;
++  int height;
++
++  // YUV420P plane pointers
++  const uint8_t* y_plane;
++  const uint8_t* u_plane;
++  const uint8_t* v_plane;
++
++  // Strides for each plane
++  int y_stride;
++  int u_stride;
++  int v_stride;
++
++  // Frame duration in microseconds (for encoder rate control)
++  int64_t duration_us;
++
++  // Capture timestamps in microseconds since some epoch
++  int64_t capture_begin_time_us;
++  int64_t capture_end_time_us;
++} SenderVideoFrame;
++
++// Audio samples to be sent (interleaved float format)
++typedef struct {
++  // Pointer to interleaved float samples
++  const float* samples;
++
++  // Number of sample tuples (multiply by channels for total floats)
++  int num_samples;
++
++  // Number of channels (1 = mono, 2 = stereo)
++  int channels;
++
++  // Sample rate in Hz (must match sender configuration, typically 48000)
++  int sample_rate;
++
++  // Capture timestamps in microseconds
++  int64_t capture_begin_time_us;
++  int64_t capture_end_time_us;
++} SenderAudioSamples;
++
++// Sender configuration
++typedef struct {
++  // Network interface name for discovery (e.g., "en0")
++  const char* interface_name;
++
++  // Path to developer certificate (optional, for connecting to dev receivers)
++  const char* developer_certificate_path;
++
++  // Video settings
++  SenderVideoCodec video_codec;
++  int max_video_bitrate;  // bits per second, 0 for default
++  int video_width;        // Target width (informational)
++  int video_height;       // Target height (informational)
++
++  // Audio settings
++  int audio_channels;     // 1 or 2
++  int audio_sample_rate;  // Typically 48000
++
++  // Whether to enable DSCP for QoS
++  bool enable_dscp;
++
++  // Use Android RTP hack for older devices
++  bool use_android_rtp_hack;
++} CastSenderConfig;
++
++// ============================================================================
++// Callback function types
++// ============================================================================
++
++// Called when a new Cast receiver is discovered
++typedef void (*CastOnReceiverDiscoveredCallback)(void* user_data,
++                                                  const SenderDiscoveredReceiver* receiver);
++
++// Called when a Cast receiver is no longer available
++typedef void (*CastOnReceiverLostCallback)(void* user_data,
++                                           const char* unique_id);
++
++// Called when connected to a receiver and ready to stream
++typedef void (*CastOnConnectedCallback)(void* user_data);
++
++// Called when disconnected from a receiver
++typedef void (*CastOnDisconnectedCallback)(void* user_data);
++
++// Called when an error occurs
++typedef void (*CastOnErrorCallback)(void* user_data,
++                                    int error_code,
++                                    const char* error_message);
++
++// Called with encoding statistics (optional)
++typedef struct {
++  int64_t frame_id;
++  int encoded_size_bytes;
++  int64_t encode_time_us;
++  double time_utilization;    // 0.0-1.0+, how much of frame time used
++  double space_utilization;   // 0.0-1.0+, how much of bitrate budget used
++  int quantizer;              // Actual quantizer used (0-63)
++} CastEncoderStats;
++
++typedef void (*CastOnEncoderStatsCallback)(void* user_data,
++                                           const CastEncoderStats* stats);
++
++// Callbacks structure
++typedef struct {
++  void* user_data;
++
++  CastOnReceiverDiscoveredCallback on_receiver_discovered;
++  CastOnReceiverLostCallback on_receiver_lost;
++  CastOnConnectedCallback on_connected;
++  CastOnDisconnectedCallback on_disconnected;
++  CastOnErrorCallback on_error;
++  CastOnEncoderStatsCallback on_encoder_stats;  // Optional
++} CastSenderCallbacks;
++
++// ============================================================================
++// API Functions
++// ============================================================================
++
++// Creates a new sender instance with the given configuration and callbacks.
++// Returns NULL on failure.
++__attribute__((visibility("default")))
++CastSender* cast_sender_create(const CastSenderConfig* config,
++                               const CastSenderCallbacks* callbacks);
++
++// Starts discovery of Cast receivers on the network.
++// Discovered receivers will be reported via on_receiver_discovered callback.
++// Returns 0 on success, non-zero on failure.
++__attribute__((visibility("default")))
++int cast_sender_start_discovery(CastSender* sender);
++
++// Stops discovery of Cast receivers.
++__attribute__((visibility("default")))
++void cast_sender_stop_discovery(CastSender* sender);
++
++// Gets the list of currently discovered receivers.
++// Returns the number of receivers copied to the output array.
++// If receivers is NULL, returns the total number of discovered receivers.
++__attribute__((visibility("default")))
++int cast_sender_get_discovered_receivers(CastSender* sender,
++                                         SenderDiscoveredReceiver* receivers,
++                                         int max_receivers);
++
++// Connects to a specific receiver by its unique_id.
++// The receiver must have been discovered first.
++// Returns 0 on success, non-zero on failure.
++__attribute__((visibility("default")))
++int cast_sender_connect(CastSender* sender, const char* receiver_unique_id);
++
++// Connects directly to a receiver by IP address and port.
++// Useful when discovery is not available.
++// Returns 0 on success, non-zero on failure.
++__attribute__((visibility("default")))
++int cast_sender_connect_to_ip(CastSender* sender,
++                              const char* ip_address,
++                              uint16_t port);
++
++// Disconnects from the current receiver.
++__attribute__((visibility("default")))
++void cast_sender_disconnect(CastSender* sender);
++
++// Sends a video frame to the receiver.
++// The frame data is copied internally, so the caller can reuse the buffer.
++// Returns 0 on success, non-zero on failure (e.g., not connected, buffer full).
++__attribute__((visibility("default")))
++int cast_sender_send_video_frame(CastSender* sender,
++                                 const SenderVideoFrame* frame);
++
++// Sends audio samples to the receiver.
++// The audio data is copied internally, so the caller can reuse the buffer.
++// Returns 0 on success, non-zero on failure.
++__attribute__((visibility("default")))
++int cast_sender_send_audio_samples(CastSender* sender,
++                                   const SenderAudioSamples* samples);
++
++// Sets the target video bitrate (can be called during streaming).
++__attribute__((visibility("default")))
++void cast_sender_set_video_bitrate(CastSender* sender, int bitrate_bps);
++
++// Gets the current estimated network bandwidth in bits per second.
++__attribute__((visibility("default")))
++int cast_sender_get_network_bandwidth(CastSender* sender);
++
++// Checks if the sender is currently connected to a receiver.
++__attribute__((visibility("default")))
++bool cast_sender_is_connected(const CastSender* sender);
++
++// Checks if discovery is currently running.
++__attribute__((visibility("default")))
++bool cast_sender_is_discovering(const CastSender* sender);
++
++// Destroys the sender instance and frees all resources.
++__attribute__((visibility("default")))
++void cast_sender_destroy(CastSender* sender);
++
++#ifdef __cplusplus
++}  // extern "C"
++#endif
++
++#endif  // CAST_STANDALONE_SENDER_MY_LIB_H_

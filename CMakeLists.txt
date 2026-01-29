@@ -24,6 +24,8 @@ include(cmake/BuildFFmpeg.cmake)
 
 include(cmake/BuildOpenscreen.cmake)
 
+add_subdirectory(src)
+
 add_custom_target(universal_stack ALL
     DEPENDS libopus libsdl3 libvpx_lipo libaom_lipo ffmpeg_lipo openscreen_lipo
     COMMENT "All universal binaries built successfully in ${CMAKE_BINARY_DIR}/install"

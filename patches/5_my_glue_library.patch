@@ -23,17 +23,37 @@ index b1784186..e80307c3 100644
      "../test:*",
      "//components/media_router/common/providers/cast/channel:openscreen_cast_auth_util_fuzzer",
 diff --git a/cast/standalone_receiver/BUILD.gn b/cast/standalone_receiver/BUILD.gn
-index 1f81e47f..920addcf 100644
+index 1f81e47f..e83807f6 100644
 --- a/cast/standalone_receiver/BUILD.gn
 +++ b/cast/standalone_receiver/BUILD.gn
-@@ -64,6 +64,46 @@ openscreen_source_set("cast_receiver_lib") {
+@@ -64,6 +64,57 @@ openscreen_source_set("cast_receiver_lib") {
    }
  }
  
 +openscreen_shared_library("cast_receiver_mylib") {
 +  testonly = true
 +  visibility += [ "../..:gn_all" ]
-+  sources = [ "my_lib.cc" ]
++  
++  public = [ "my_lib.h" ]
++  sources = [
++    "my_lib.cc",
++    "my_lib.h",
++  ]
++
++  libs = [
++    "z",
++    "aom",
++    "opus",
++    "vpx",
++    "SDL3",
++  ]
++
++  if (have_ffmpeg && have_libsdl3) {
++    defines = [ "CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS" ]
++    include_dirs = ffmpeg_include_dirs + libsdl3_include_dirs
++    lib_dirs = external_lib_dirs + ffmpeg_lib_dirs + libsdl3_lib_dirs
++    libs += ffmpeg_libs + libsdl3_libs
++  }
 +
 +  frameworks = [
 +    "Cocoa.framework",
@@ -48,15 +68,6 @@ index 1f81e47f..920addcf 100644
 +    "CoreFoundation.framework",
 +    "CoreMedia.framework",
 +    "VideoToolbox.framework",
-+    "CoreVideo.framework",
-+  ]
-+
-+  libs = [
-+    "z",
-+    "aom",
-+    "opus",
-+    "vpx",
-+    "SDL3",
 +  ]
 +
 +  deps = [
@@ -83,11 +94,18 @@ index 00000000..29751036
 +                                                            char* argv[]) {
 +  return 0;
 +}
+diff --git a/cast/standalone_receiver/my_lib.hh b/cast/standalone_receiver/my_lib.hh
+new file mode 100644
+index 00000000..9a7d3bbd
+--- /dev/null
++++ b/cast/standalone_receiver/my_lib.hh
+@@ -0,0 +1 @@
++int todo(int argc,char* argv[]);
 diff --git a/cast/standalone_sender/BUILD.gn b/cast/standalone_sender/BUILD.gn
-index 5ee21736..d31f0771 100644
+index 5ee21736..9aab5045 100644
 --- a/cast/standalone_sender/BUILD.gn
 +++ b/cast/standalone_sender/BUILD.gn
-@@ -24,6 +24,102 @@ if (!build_with_chromium) {
+@@ -24,6 +24,108 @@ if (!build_with_chromium) {
      }
    }
  
@@ -110,7 +128,11 @@ index 5ee21736..d31f0771 100644
 +      "../streaming:sender",
 +    ]
 +
-+    sources = [ "my_lib.cc" ]
++    public = [ "my_lib.h" ]
++    sources = [
++      "my_lib.cc",
++      "my_lib.h",
++    ]
 +    include_dirs = []
 +    lib_dirs = []
 +    frameworks = [
@@ -131,13 +153,15 @@ index 5ee21736..d31f0771 100644
 +
 +    libs = [
 +        "z",
-+        "aom",
-+        "opus",
-+        "vpx",
-+        "SDL3",
 +    ]
 +
 +    if (have_external_libs) {
++      libs += [
++          "aom",
++          "opus",
++          "vpx",
++          "SDL3",
++      ]
 +      sources += [
 +        "connection_settings.h",
 +        "ffmpeg_glue.cc",
@@ -190,6 +214,26 @@ index 5ee21736..d31f0771 100644
    openscreen_executable("cast_sender") {
      testonly = true
      visibility += [ "../..:gn_all" ]
+@@ -64,13 +166,15 @@ if (!build_with_chromium) {
+ 
+     libs = [
+         "z",
+-        "aom",
+-        "opus",
+-        "vpx",
+-        "SDL3",
+     ]
+ 
+     if (have_external_libs) {
++      libs += [
++          "aom",
++          "opus",
++          "vpx",
++          "SDL3",
++      ]
+       sources += [
+         "connection_settings.h",
+         "ffmpeg_glue.cc",
 diff --git a/cast/standalone_sender/my_lib.cc b/cast/standalone_sender/my_lib.cc
 new file mode 100644
 index 00000000..29751036
@@ -200,6 +244,13 @@ index 00000000..29751036
 +                                                            char* argv[]) {
 +  return 0;
 +}
+diff --git a/cast/standalone_sender/my_lib.hh b/cast/standalone_sender/my_lib.hh
+new file mode 100644
+index 00000000..9a7d3bbd
+--- /dev/null
++++ b/cast/standalone_sender/my_lib.hh
+@@ -0,0 +1 @@
++int todo(int argc,char* argv[]);
 diff --git a/platform/BUILD.gn b/platform/BUILD.gn
 index 1c409666..18c329ee 100644
 --- a/platform/BUILD.gn

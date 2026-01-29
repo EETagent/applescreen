@@ -80,6 +80,16 @@ ARCH=\"$3\"
 mkdir -p \"$INSTALL_DIR/lib\"
 mkdir -p \"$INSTALL_DIR/include/openscreen\"
 mkdir -p \"$INSTALL_DIR/bin\"
+mkdir -p \"$INSTALL_DIR/include/cast/standalone_receiver\"
+mkdir -p \"$INSTALL_DIR/include/cast/standalone_sender\"
+
+# Copy headers
+if [ -f \"$SRC_DIR/openscreen/cast/standalone_receiver/my_lib.h\" ]; then
+    cp \"$SRC_DIR/openscreen/cast/standalone_receiver/my_lib.h\" \"$INSTALL_DIR/include/cast/standalone_receiver/\"
+fi
+if [ -f \"$SRC_DIR/openscreen/cast/standalone_sender/my_lib.h\" ]; then
+    cp \"$SRC_DIR/openscreen/cast/standalone_sender/my_lib.h\" \"$INSTALL_DIR/include/cast/standalone_sender/\"
+fi
 
 # Copy binaries (flatten structure)
 if [ -f \"$SRC_DIR/openscreen/out/$ARCH/cast_receiver\" ]; then
