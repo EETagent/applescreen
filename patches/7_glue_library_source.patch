@@ -1351,10 +1351,10 @@ index 00000000..3ffa2e29
 +
 +#endif  // CAST_STANDALONE_RECEIVER_MY_LIB_H_
 diff --git a/cast/standalone_sender/my_lib.cc b/cast/standalone_sender/my_lib.cc
-index 29751036..e84fc28a 100644
+index 29751036..91e12057 100644
 --- a/cast/standalone_sender/my_lib.cc
 +++ b/cast/standalone_sender/my_lib.cc
-@@ -1,4 +1,1009 @@
+@@ -1,4 +1,1010 @@
 -extern "C" __attribute__((visibility("default"))) int todo(int argc,
 -                                                            char* argv[]) {
 +// Copyright 2024 The Chromium Authors
@@ -1967,7 +1967,8 @@ index 29751036..e84fc28a 100644
 +        std::string destination_id;
 +        if (json::TryParseString(app_value["transportId"], &destination_id)) {
 +          remote_connection_.emplace(VirtualConnection{
-+              kPlatformSenderId, destination_id, message_port_.GetSocketId()});
++              MakeUniqueSessionId("streaming_sender"), destination_id,
++              message_port_.GetSocketId()});
 +          connection_handler_.OpenRemoteConnection(
 +              *remote_connection_,
 +              [this](bool success) { OnRemoteMessagingOpened(success); });
@@ -2020,7 +2021,7 @@ index 29751036..e84fc28a 100644
 +      .client = *this,
 +      .environment = environment_.get(),
 +      .message_port = &message_port_,
-+      .message_source_id = message_port_.source_id(),
++      .message_source_id = remote_connection_->local_id,
 +      .message_destination_id = remote_connection_->peer_id,
 +      .use_android_rtp_hack = config_.use_android_rtp_hack,
 +      .enable_dscp = config_.enable_dscp};
