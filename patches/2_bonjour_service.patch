@@ -1,19 +1,21 @@
 diff --git a/discovery/BUILD.gn b/discovery/BUILD.gn
-index 256e81af..1010b3f2 100644
+index 256e81af..854632e9 100644
 --- a/discovery/BUILD.gn
 +++ b/discovery/BUILD.gn
-@@ -92,6 +92,10 @@ openscreen_source_set("dnssd") {
+@@ -92,6 +92,12 @@ openscreen_source_set("dnssd") {
    ]
    public = []
    sources = [
 +    "dnssd/impl/bonjour_publisher_impl.cc",
 +    "dnssd/impl/bonjour_publisher_impl.h",
++    "dnssd/impl/bonjour_querier_impl.cc",
++    "dnssd/impl/bonjour_querier_impl.h",
 +    "dnssd/impl/bonjour_service_dispatcher.cc",
 +    "dnssd/impl/bonjour_service_dispatcher.h",
      "dnssd/impl/conversion_layer.cc",
      "dnssd/impl/conversion_layer.h",
      "dnssd/impl/dns_data_graph.cc",
-@@ -112,6 +116,8 @@ openscreen_source_set("dnssd") {
+@@ -112,6 +118,8 @@ openscreen_source_set("dnssd") {
      "dnssd/impl/service_key.h",
    ]
  
@@ -476,12 +478,781 @@ index 00000000..89f321e9
 +}  // namespace openscreen
 +
 +#endif  // DISCOVERY_DNSSD_IMPL_BONJOUR_PUBLISHER_IMPL_H_
+diff --git a/discovery/dnssd/impl/bonjour_querier_impl.cc b/discovery/dnssd/impl/bonjour_querier_impl.cc
+new file mode 100644
+index 00000000..0b0531ce
+--- /dev/null
++++ b/discovery/dnssd/impl/bonjour_querier_impl.cc
+@@ -0,0 +1,629 @@
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "discovery/dnssd/impl/bonjour_querier_impl.h"
++
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/select.h>
++#include <sys/socket.h>
++
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "discovery/common/reporting_client.h"
++#include "discovery/dnssd/impl/instance_key.h"
++#include "discovery/dnssd/public/dns_sd_txt_record.h"
++#include "platform/api/task_runner.h"
++#include "util/osp_logging.h"
++
++namespace openscreen::discovery {
++namespace {
++
++DnsSdTxtRecord ParseTxtRecord(uint16_t txt_len,
++                              const unsigned char* txt_record) {
++  DnsSdTxtRecord txt;
++  size_t offset = 0;
++  while (offset < txt_len) {
++    uint8_t len = txt_record[offset];
++    if (offset + 1 + len > txt_len) {
++      break;
++    }
++    std::string entry(reinterpret_cast<const char*>(&txt_record[offset + 1]),
++                      len);
++    size_t equals = entry.find('=');
++    if (equals != std::string::npos) {
++      std::string key = entry.substr(0, equals);
++      std::string value = entry.substr(equals + 1);
++      txt.SetValue(key, value);
++    } else {
++      txt.SetFlag(entry, true);
++    }
++    offset += 1 + len;
++  }
++  return txt;
++}
++
++}  // namespace
++
++struct BonjourQuerierImpl::BrowseContext {
++  std::string service_type;
++  DNSServiceRef service_ref = nullptr;
++  std::thread browse_thread;
++  std::atomic_bool stop_requested = false;
++  BonjourQuerierImpl* owner = nullptr;
++
++  explicit BrowseContext(std::string service_type_in,
++                         BonjourQuerierImpl* owner_in)
++      : service_type(std::move(service_type_in)), owner(owner_in) {}
++};
++
++struct BonjourQuerierImpl::ResolveContext {
++  std::string service_type;
++  std::string instance_name;
++  std::string domain;
++  uint32_t interface_index;
++  DNSServiceRef service_ref = nullptr;
++  BonjourQuerierImpl* owner = nullptr;
++  DnsSdTxtRecord txt;
++  uint16_t port = 0;
++  std::string hosttarget;
++};
++
++struct BonjourQuerierImpl::AddressContext {
++  std::string service_type;
++  std::string instance_name;
++  std::string domain;
++  uint32_t interface_index;
++  DNSServiceRef service_ref = nullptr;
++  BonjourQuerierImpl* owner = nullptr;
++  DnsSdTxtRecord txt;
++  uint16_t port = 0;
++  std::vector<IPEndpoint> endpoints;  // Accumulates multiple addresses.
++};
++
++BonjourQuerierImpl::BonjourQuerierImpl(TaskRunner& task_runner,
++                                       ReportingClient& reporting_client,
++                                       std::vector<InterfaceInfo> interfaces)
++    : task_runner_(task_runner),
++      reporting_client_(reporting_client),
++      interfaces_(std::move(interfaces)) {}
++
++BonjourQuerierImpl::~BonjourQuerierImpl() {
++  for (auto& [service, context] : browse_contexts_) {
++    StopBrowse(*context);
++  }
++}
++
++void BonjourQuerierImpl::StartQuery(const std::string& service, Callback* cb) {
++  OSP_LOG_INFO << "BonjourQuerier: StartQuery for service '" << service << "'";
++  auto& callbacks = callbacks_[service];
++  callbacks.push_back(cb);
++
++  // Only start browsing if this is the first callback for this service.
++  if (callbacks.size() == 1) {
++    auto context = std::make_unique<BrowseContext>(service, this);
++
++    DNSServiceRef service_ref = nullptr;
++    const DNSServiceErrorType result = DNSServiceBrowse(
++        &service_ref, 0, kDNSServiceInterfaceIndexAny, service.c_str(), nullptr,
++        &BonjourQuerierImpl::OnBrowseResult, context.get());
++
++    if (result != kDNSServiceErr_NoError) {
++      OSP_LOG_ERROR << "BonjourQuerier: DNSServiceBrowse failed with error "
++                    << result;
++      reporting_client_.OnRecoverableError(
++          Error(Error::Code::kMdnsReadFailure, "DNSServiceBrowse failed"));
++      callbacks.pop_back();
++      if (callbacks.empty()) {
++        callbacks_.erase(service);
++      }
++      return;
++    }
++
++    OSP_LOG_INFO << "BonjourQuerier: DNSServiceBrowse started successfully";
++    context->service_ref = service_ref;
++    browse_contexts_[service] = std::move(context);
++    StartBrowseThread(*browse_contexts_[service]);
++  }
++}
++
++void BonjourQuerierImpl::StopQuery(const std::string& service, Callback* cb) {
++  auto callbacks_it = callbacks_.find(service);
++  if (callbacks_it == callbacks_.end()) {
++    return;
++  }
++
++  auto& callbacks = callbacks_it->second;
++  callbacks.erase(std::remove(callbacks.begin(), callbacks.end(), cb),
++                  callbacks.end());
++
++  if (callbacks.empty()) {
++    callbacks_.erase(callbacks_it);
++    auto browse_it = browse_contexts_.find(service);
++    if (browse_it != browse_contexts_.end()) {
++      StopBrowse(*browse_it->second);
++      browse_contexts_.erase(browse_it);
++    }
++  }
++}
++
++void BonjourQuerierImpl::ReinitializeQueries(const std::string& service) {
++  auto browse_it = browse_contexts_.find(service);
++  if (browse_it == browse_contexts_.end()) {
++    return;
++  }
++
++  StopBrowse(*browse_it->second);
++
++  auto context = std::make_unique<BrowseContext>(service, this);
++  DNSServiceRef service_ref = nullptr;
++  const DNSServiceErrorType result = DNSServiceBrowse(
++      &service_ref, 0, kDNSServiceInterfaceIndexAny, service.c_str(), nullptr,
++      &BonjourQuerierImpl::OnBrowseResult, context.get());
++
++  if (result != kDNSServiceErr_NoError) {
++    reporting_client_.OnRecoverableError(
++        Error(Error::Code::kMdnsReadFailure,
++              "DNSServiceBrowse failed on reinit"));
++    browse_contexts_.erase(browse_it);
++    return;
++  }
++
++  context->service_ref = service_ref;
++  browse_contexts_[service] = std::move(context);
++  StartBrowseThread(*browse_contexts_[service]);
++}
++
++void BonjourQuerierImpl::StartBrowseThread(BrowseContext& context) {
++  context.browse_thread = std::thread([&context] {
++    const int fd = DNSServiceRefSockFD(context.service_ref);
++    if (fd < 0) {
++      return;
++    }
++
++    while (!context.stop_requested.load(std::memory_order_relaxed)) {
++      fd_set read_fds;
++      FD_ZERO(&read_fds);
++      FD_SET(fd, &read_fds);
++      timeval timeout{1, 0};
++      const int result = select(fd + 1, &read_fds, nullptr, nullptr, &timeout);
++      if (result > 0 && FD_ISSET(fd, &read_fds)) {
++        DNSServiceProcessResult(context.service_ref);
++      }
++    }
++  });
++}
++
++void BonjourQuerierImpl::StopBrowse(BrowseContext& context) {
++  context.stop_requested.store(true, std::memory_order_relaxed);
++  if (context.browse_thread.joinable()) {
++    context.browse_thread.join();
++  }
++  if (context.service_ref) {
++    DNSServiceRefDeallocate(context.service_ref);
++    context.service_ref = nullptr;
++  }
++}
++
++void BonjourQuerierImpl::OnBrowseResult(DNSServiceRef service_ref,
++                                        DNSServiceFlags flags,
++                                        uint32_t interface_index,
++                                        DNSServiceErrorType error,
++                                        const char* name,
++                                        const char* regtype,
++                                        const char* domain,
++                                        void* context) {
++  (void)service_ref;
++  auto* browse_context = static_cast<BrowseContext*>(context);
++  if (!browse_context || !browse_context->owner) {
++    return;
++  }
++
++  browse_context->owner->HandleBrowseResult(browse_context->service_type, flags,
++                                            interface_index, error, name,
++                                            regtype, domain);
++}
++
++void BonjourQuerierImpl::HandleBrowseResult(const std::string& service,
++                                            DNSServiceFlags flags,
++                                            uint32_t interface_index,
++                                            DNSServiceErrorType error,
++                                            const char* name,
++                                            const char* regtype,
++                                            const char* domain) {
++  OSP_LOG_INFO << "BonjourQuerier: HandleBrowseResult - name='"
++               << (name ? name : "null") << "' regtype='"
++               << (regtype ? regtype : "null") << "' domain='"
++               << (domain ? domain : "null") << "' flags=" << flags
++               << " error=" << error;
++
++  if (error != kDNSServiceErr_NoError) {
++    OSP_LOG_ERROR << "BonjourQuerier: Browse callback error: " << error;
++    task_runner_.PostTask([weak_this = weak_factory_.GetWeakPtr()] {
++      if (weak_this) {
++        weak_this->reporting_client_.OnRecoverableError(
++            Error(Error::Code::kMdnsReadFailure, "Browse callback error"));
++      }
++    });
++    return;
++  }
++
++  const bool is_add = (flags & kDNSServiceFlagsAdd) != 0;
++  std::string instance_name = name ? name : "";
++  std::string domain_str = domain ? domain : "";
++
++  OSP_LOG_INFO << "BonjourQuerier: is_add=" << is_add
++               << " instance='" << instance_name << "'";
++
++  if (is_add) {
++    // Start a resolve to get full service info.
++    auto* resolve_context = new ResolveContext();
++    resolve_context->service_type = service;
++    resolve_context->instance_name = instance_name;
++    resolve_context->domain = domain_str;
++    resolve_context->interface_index = interface_index;
++    resolve_context->owner = this;
++
++    DNSServiceRef resolve_ref = nullptr;
++    const DNSServiceErrorType resolve_result = DNSServiceResolve(
++        &resolve_ref, 0, interface_index, name, regtype, domain,
++        &BonjourQuerierImpl::OnResolveResult, resolve_context);
++
++    if (resolve_result != kDNSServiceErr_NoError) {
++      OSP_LOG_ERROR << "BonjourQuerier: DNSServiceResolve failed with error "
++                    << resolve_result;
++      delete resolve_context;
++      return;
++    }
++
++    OSP_LOG_INFO << "BonjourQuerier: DNSServiceResolve started for '"
++                 << instance_name << "'";
++
++    resolve_context->service_ref = resolve_ref;
++
++    // Process resolve synchronously with retries.
++    const int fd = DNSServiceRefSockFD(resolve_ref);
++    OSP_LOG_INFO << "BonjourQuerier: Resolve fd=" << fd;
++    if (fd >= 0) {
++      fd_set read_fds;
++      FD_ZERO(&read_fds);
++      FD_SET(fd, &read_fds);
++      timeval timeout{5, 0};
++      const int select_result =
++          select(fd + 1, &read_fds, nullptr, nullptr, &timeout);
++      OSP_LOG_INFO << "BonjourQuerier: Resolve select_result=" << select_result;
++      if (select_result > 0 && FD_ISSET(fd, &read_fds)) {
++        OSP_LOG_INFO << "BonjourQuerier: Processing resolve result";
++        DNSServiceProcessResult(resolve_ref);
++      } else {
++        // Timeout or error - clean up resolve context.
++        OSP_LOG_WARN << "BonjourQuerier: Resolve timeout or error";
++        DNSServiceRefDeallocate(resolve_ref);
++        delete resolve_context;
++      }
++    } else {
++      // Invalid fd - clean up resolve context.
++      OSP_LOG_ERROR << "BonjourQuerier: Invalid resolve fd";
++      DNSServiceRefDeallocate(resolve_ref);
++      delete resolve_context;
++    }
++    // Note: ResolveContext is cleaned up in OnResolveResult or here on timeout.
++  } else {
++    // Service removed - notify deletion.
++    task_runner_.PostTask(
++        [weak_this = weak_factory_.GetWeakPtr(), service, instance_name,
++         domain_str, interface_index] {
++          if (!weak_this) {
++            return;
++          }
++          DnsSdInstanceEndpoint endpoint(instance_name, service, domain_str,
++                                         DnsSdTxtRecord(), interface_index,
++                                         std::vector<IPEndpoint>());
++          weak_this->NotifyEndpointDeleted(endpoint, service);
++        });
++  }
++}
++
++void BonjourQuerierImpl::OnResolveResult(DNSServiceRef service_ref,
++                                         DNSServiceFlags flags,
++                                         uint32_t interface_index,
++                                         DNSServiceErrorType error,
++                                         const char* fullname,
++                                         const char* hosttarget,
++                                         uint16_t port,
++                                         uint16_t txt_len,
++                                         const unsigned char* txt_record,
++                                         void* context) {
++  (void)service_ref;
++  (void)flags;
++  (void)interface_index;
++  (void)fullname;
++
++  auto* resolve_context = static_cast<ResolveContext*>(context);
++  if (!resolve_context || !resolve_context->owner) {
++    delete resolve_context;
++    return;
++  }
++
++  resolve_context->owner->HandleResolveResult(resolve_context, error, fullname,
++                                              hosttarget, port, txt_len,
++                                              txt_record);
++}
++
++void BonjourQuerierImpl::HandleResolveResult(ResolveContext* context,
++                                             DNSServiceErrorType error,
++                                             const char* fullname,
++                                             const char* hosttarget,
++                                             uint16_t port,
++                                             uint16_t txt_len,
++                                             const unsigned char* txt_record) {
++  OSP_LOG_INFO << "BonjourQuerier: HandleResolveResult - fullname='"
++               << (fullname ? fullname : "null") << "' hosttarget='"
++               << (hosttarget ? hosttarget : "null") << "' port=" << ntohs(port)
++               << " error=" << error;
++
++  if (context->service_ref) {
++    DNSServiceRefDeallocate(context->service_ref);
++    context->service_ref = nullptr;
++  }
++
++  if (error != kDNSServiceErr_NoError) {
++    OSP_LOG_ERROR << "BonjourQuerier: Resolve error: " << error;
++    delete context;
++    return;
++  }
++
++  (void)fullname;
++
++  // Parse TXT record and store data.
++  context->txt = ParseTxtRecord(txt_len, txt_record);
++  context->port = ntohs(port);
++  context->hosttarget = hosttarget ? hosttarget : "";
++
++  // Now resolve the address.
++  OSP_LOG_INFO << "BonjourQuerier: Starting address lookup for '"
++               << context->hosttarget << "'";
++  auto* address_context = new AddressContext();
++  address_context->service_type = context->service_type;
++  address_context->instance_name = context->instance_name;
++  address_context->domain = context->domain;
++  address_context->interface_index = context->interface_index;
++  address_context->owner = this;
++  address_context->txt = std::move(context->txt);
++  address_context->port = context->port;
++
++  DNSServiceRef address_ref = nullptr;
++  const DNSServiceErrorType result = DNSServiceGetAddrInfo(
++      &address_ref, 0, context->interface_index,
++      kDNSServiceProtocol_IPv4 | kDNSServiceProtocol_IPv6,
++      context->hosttarget.c_str(), &BonjourQuerierImpl::OnAddressResult,
++      address_context);
++
++  delete context;
++
++  if (result != kDNSServiceErr_NoError) {
++    OSP_LOG_ERROR << "BonjourQuerier: DNSServiceGetAddrInfo failed: " << result;
++    delete address_context;
++    return;
++  }
++
++  OSP_LOG_INFO << "BonjourQuerier: DNSServiceGetAddrInfo started";
++  address_context->service_ref = address_ref;
++
++  // Process address lookup synchronously - loop to collect multiple addresses.
++  const int fd = DNSServiceRefSockFD(address_ref);
++  OSP_LOG_INFO << "BonjourQuerier: Address lookup fd=" << fd;
++  if (fd >= 0) {
++    bool more_coming = true;
++    while (more_coming) {
++      fd_set read_fds;
++      FD_ZERO(&read_fds);
++      FD_SET(fd, &read_fds);
++      timeval timeout{2, 0};
++      const int select_result =
++          select(fd + 1, &read_fds, nullptr, nullptr, &timeout);
++      OSP_LOG_INFO << "BonjourQuerier: Address select_result=" << select_result;
++      if (select_result > 0 && FD_ISSET(fd, &read_fds)) {
++        OSP_LOG_INFO << "BonjourQuerier: Processing address result";
++        DNSServiceProcessResult(address_ref);
++        // Check if we got any endpoints and if more are expected.
++        // The callback sets more_coming flag via context if needed.
++        // For now, assume after one result with data we might get more.
++        // Break if we have at least one endpoint and timeout on next.
++        OSP_LOG_INFO << "BonjourQuerier: Collected "
++                     << address_context->endpoints.size() << " endpoints so far";
++        if (!address_context->endpoints.empty()) {
++          // Try once more with short timeout for additional addresses.
++          FD_ZERO(&read_fds);
++          FD_SET(fd, &read_fds);
++          timeval short_timeout{0, 500000};  // 500ms
++          const int extra_result =
++              select(fd + 1, &read_fds, nullptr, nullptr, &short_timeout);
++          if (extra_result > 0 && FD_ISSET(fd, &read_fds)) {
++            OSP_LOG_INFO << "BonjourQuerier: Processing extra address result";
++            DNSServiceProcessResult(address_ref);
++          }
++          more_coming = false;
++        }
++      } else {
++        OSP_LOG_WARN << "BonjourQuerier: Address lookup timeout or error";
++        more_coming = false;
++      }
++    }
++  }
++
++  // If we collected addresses, notify now.
++  if (!address_context->endpoints.empty()) {
++    DnsSdInstanceEndpoint endpoint(address_context->instance_name,
++                                   address_context->service_type,
++                                   address_context->domain,
++                                   std::move(address_context->txt),
++                                   address_context->interface_index,
++                                   std::move(address_context->endpoints));
++
++    OSP_LOG_INFO << "BonjourQuerier: Created endpoint for '"
++                 << address_context->instance_name << "' with "
++                 << endpoint.endpoints().size() << " addresses, posting to task runner";
++
++    std::string service = address_context->service_type;
++    if (address_context->service_ref) {
++      DNSServiceRefDeallocate(address_context->service_ref);
++    }
++    delete address_context;
++
++    task_runner_.PostTask([weak_this = weak_factory_.GetWeakPtr(),
++                           endpoint = std::move(endpoint), service]() mutable {
++      OSP_LOG_INFO << "BonjourQuerier: Task runner callback executing";
++      if (weak_this) {
++        OSP_LOG_INFO << "BonjourQuerier: Calling NotifyEndpointCreated";
++        weak_this->NotifyEndpointCreated(endpoint, service);
++      } else {
++        OSP_LOG_WARN << "BonjourQuerier: weak_this is null in task";
++      }
++    });
++  } else {
++    // No addresses found - clean up.
++    OSP_LOG_WARN << "BonjourQuerier: No addresses collected, cleaning up";
++    if (address_context->service_ref) {
++      DNSServiceRefDeallocate(address_context->service_ref);
++    }
++    delete address_context;
++  }
++}
++
++void BonjourQuerierImpl::OnAddressResult(DNSServiceRef service_ref,
++                                         DNSServiceFlags flags,
++                                         uint32_t interface_index,
++                                         DNSServiceErrorType error,
++                                         const char* hostname,
++                                         const struct sockaddr* address,
++                                         uint32_t ttl,
++                                         void* context) {
++  (void)service_ref;
++  (void)flags;
++  (void)interface_index;
++  (void)ttl;
++
++  auto* address_context = static_cast<AddressContext*>(context);
++  if (!address_context || !address_context->owner) {
++    delete address_context;
++    return;
++  }
++
++  address_context->owner->HandleAddressResult(address_context, error, hostname,
++                                              address);
++}
++
++void BonjourQuerierImpl::HandleAddressResult(AddressContext* context,
++                                             DNSServiceErrorType error,
++                                             const char* hostname,
++                                             const struct sockaddr* address) {
++  OSP_LOG_INFO << "BonjourQuerier: HandleAddressResult - hostname='"
++               << (hostname ? hostname : "null") << "' error=" << error
++               << " address=" << (address ? "present" : "null");
++
++  // Don't deallocate service_ref here - it's managed by HandleResolveResult.
++  // Just accumulate addresses.
++
++  if (error != kDNSServiceErr_NoError || !address) {
++    OSP_LOG_WARN << "BonjourQuerier: Address error or null address";
++    return;
++  }
++
++  (void)hostname;
++
++  if (address->sa_family == AF_INET) {
++    const auto* addr_in = reinterpret_cast<const sockaddr_in*>(address);
++    IPAddress ip(IPAddress::Version::kV4,
++                 reinterpret_cast<const uint8_t*>(&addr_in->sin_addr.s_addr));
++    OSP_LOG_INFO << "BonjourQuerier: Got IPv4 address: " << ip;
++    context->endpoints.push_back(IPEndpoint{ip, context->port});
++  } else if (address->sa_family == AF_INET6) {
++    const auto* addr_in6 = reinterpret_cast<const sockaddr_in6*>(address);
++    IPAddress ip(IPAddress::Version::kV6, addr_in6->sin6_addr.s6_addr);
++    OSP_LOG_INFO << "BonjourQuerier: Got IPv6 address: " << ip;
++    context->endpoints.push_back(IPEndpoint{ip, context->port});
++  } else {
++    OSP_LOG_WARN << "BonjourQuerier: Unknown address family: "
++                 << address->sa_family;
++  }
++}
++
++void BonjourQuerierImpl::NotifyEndpointCreated(
++    const DnsSdInstanceEndpoint& endpoint,
++    const std::string& service) {
++  OSP_LOG_INFO << "BonjourQuerier: NotifyEndpointCreated called for '"
++               << endpoint.instance_id() << "' service='" << service << "'";
++
++  auto it = callbacks_.find(service);
++  if (it == callbacks_.end()) {
++    OSP_LOG_WARN << "BonjourQuerier: No callbacks found for service '"
++                 << service << "'";
++    return;
++  }
++
++  OSP_LOG_INFO << "BonjourQuerier: Found " << it->second.size()
++               << " callbacks for service";
++
++  // Create key for tracking.
++  InstanceKey key(endpoint.instance_id(), endpoint.service_id(),
++                  endpoint.domain_id());
++
++  // Check if this endpoint was previously known.
++  auto known_it = known_endpoints_.find(key);
++  if (known_it != known_endpoints_.end()) {
++    // Endpoint exists - check if it actually changed.
++    if (known_it->second != endpoint) {
++      known_it->second = endpoint;
++      for (auto* callback : it->second) {
++        callback->OnEndpointUpdated(endpoint);
++      }
++    }
++    // If equal, no notification needed.
++  } else {
++    // New endpoint.
++    known_endpoints_.emplace(key, endpoint);
++    for (auto* callback : it->second) {
++      callback->OnEndpointCreated(endpoint);
++    }
++  }
++}
++
++void BonjourQuerierImpl::NotifyEndpointUpdated(
++    const DnsSdInstanceEndpoint& endpoint,
++    const std::string& service) {
++  auto it = callbacks_.find(service);
++  if (it == callbacks_.end()) {
++    return;
++  }
++
++  InstanceKey key(endpoint.instance_id(), endpoint.service_id(),
++                  endpoint.domain_id());
++  known_endpoints_.insert_or_assign(key, endpoint);
++
++  for (auto* callback : it->second) {
++    callback->OnEndpointUpdated(endpoint);
++  }
++}
++
++void BonjourQuerierImpl::NotifyEndpointDeleted(
++    const DnsSdInstanceEndpoint& endpoint,
++    const std::string& service) {
++  auto it = callbacks_.find(service);
++  if (it == callbacks_.end()) {
++    return;
++  }
++
++  // Remove from tracking.
++  InstanceKey key(endpoint.instance_id(), endpoint.service_id(),
++                  endpoint.domain_id());
++  known_endpoints_.erase(key);
++
++  for (auto* callback : it->second) {
++    callback->OnEndpointDeleted(endpoint);
++  }
++}
++
++}  // namespace openscreen::discovery
+diff --git a/discovery/dnssd/impl/bonjour_querier_impl.h b/discovery/dnssd/impl/bonjour_querier_impl.h
+new file mode 100644
+index 00000000..92ee1c6c
+--- /dev/null
++++ b/discovery/dnssd/impl/bonjour_querier_impl.h
+@@ -0,0 +1,128 @@
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef DISCOVERY_DNSSD_IMPL_BONJOUR_QUERIER_IMPL_H_
++#define DISCOVERY_DNSSD_IMPL_BONJOUR_QUERIER_IMPL_H_
++
++#include <dns_sd.h>
++
++#include <atomic>
++#include <map>
++#include <memory>
++#include <set>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "discovery/dnssd/impl/instance_key.h"
++#include "discovery/dnssd/public/dns_sd_instance_endpoint.h"
++#include "discovery/dnssd/public/dns_sd_querier.h"
++#include "platform/base/interface_info.h"
++#include "util/weak_ptr.h"
++
++namespace openscreen {
++
++class TaskRunner;
++
++namespace discovery {
++
++class ReportingClient;
++
++class BonjourQuerierImpl final : public DnsSdQuerier {
++ public:
++  BonjourQuerierImpl(TaskRunner& task_runner,
++                     ReportingClient& reporting_client,
++                     std::vector<InterfaceInfo> interfaces);
++  ~BonjourQuerierImpl() override;
++
++  // DnsSdQuerier overrides.
++  void StartQuery(const std::string& service, Callback* cb) override;
++  void StopQuery(const std::string& service, Callback* cb) override;
++  void ReinitializeQueries(const std::string& service) override;
++
++ private:
++  struct BrowseContext;
++  struct ResolveContext;
++  struct AddressContext;
++
++  void StartBrowseThread(BrowseContext& context);
++  void StopBrowse(BrowseContext& context);
++
++  void HandleBrowseResult(const std::string& service,
++                          DNSServiceFlags flags,
++                          uint32_t interface_index,
++                          DNSServiceErrorType error,
++                          const char* name,
++                          const char* regtype,
++                          const char* domain);
++
++  void HandleResolveResult(ResolveContext* context,
++                           DNSServiceErrorType error,
++                           const char* fullname,
++                           const char* hosttarget,
++                           uint16_t port,
++                           uint16_t txt_len,
++                           const unsigned char* txt_record);
++
++  void HandleAddressResult(AddressContext* context,
++                           DNSServiceErrorType error,
++                           const char* hostname,
++                           const struct sockaddr* address);
++
++  void NotifyEndpointCreated(const DnsSdInstanceEndpoint& endpoint,
++                             const std::string& service);
++  void NotifyEndpointUpdated(const DnsSdInstanceEndpoint& endpoint,
++                             const std::string& service);
++  void NotifyEndpointDeleted(const DnsSdInstanceEndpoint& endpoint,
++                             const std::string& service);
++
++  static void DNSSD_API OnBrowseResult(DNSServiceRef service_ref,
++                                       DNSServiceFlags flags,
++                                       uint32_t interface_index,
++                                       DNSServiceErrorType error,
++                                       const char* name,
++                                       const char* regtype,
++                                       const char* domain,
++                                       void* context);
++
++  static void DNSSD_API OnResolveResult(DNSServiceRef service_ref,
++                                        DNSServiceFlags flags,
++                                        uint32_t interface_index,
++                                        DNSServiceErrorType error,
++                                        const char* fullname,
++                                        const char* hosttarget,
++                                        uint16_t port,
++                                        uint16_t txt_len,
++                                        const unsigned char* txt_record,
++                                        void* context);
++
++  static void DNSSD_API OnAddressResult(DNSServiceRef service_ref,
++                                        DNSServiceFlags flags,
++                                        uint32_t interface_index,
++                                        DNSServiceErrorType error,
++                                        const char* hostname,
++                                        const struct sockaddr* address,
++                                        uint32_t ttl,
++                                        void* context);
++
++  TaskRunner& task_runner_;
++  ReportingClient& reporting_client_;
++  std::vector<InterfaceInfo> interfaces_;
++
++  // Map from service type to browse context.
++  std::map<std::string, std::unique_ptr<BrowseContext>> browse_contexts_;
++
++  // Map from service type to callbacks.
++  std::map<std::string, std::vector<Callback*>> callbacks_;
++
++  // Tracks known endpoints by InstanceKey for distinguishing create vs update.
++  std::map<InstanceKey, DnsSdInstanceEndpoint> known_endpoints_;
++
++  // Must be the last member to ensure weak pointers are invalidated first.
++  WeakPtrFactory<BonjourQuerierImpl> weak_factory_{this};
++};
++
++}  // namespace discovery
++}  // namespace openscreen
++
++#endif  // DISCOVERY_DNSSD_IMPL_BONJOUR_QUERIER_IMPL_H_
 diff --git a/discovery/dnssd/impl/bonjour_service_dispatcher.cc b/discovery/dnssd/impl/bonjour_service_dispatcher.cc
 new file mode 100644
-index 00000000..a26ab78a
+index 00000000..e9495f41
 --- /dev/null
 +++ b/discovery/dnssd/impl/bonjour_service_dispatcher.cc
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,32 @@
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
@@ -490,6 +1261,7 @@ index 00000000..a26ab78a
 +#include "discovery/common/config.h"
 +#include "discovery/common/reporting_client.h"
 +#include "discovery/dnssd/impl/bonjour_publisher_impl.h"
++#include "discovery/dnssd/impl/bonjour_querier_impl.h"
 +#include "platform/api/task_runner.h"
 +
 +namespace openscreen::discovery {
@@ -498,7 +1270,12 @@ index 00000000..a26ab78a
 +    TaskRunner& task_runner,
 +    ReportingClient& reporting_client,
 +    const Config& config)
-+    : publisher_(config.enable_publication
++    : querier_(config.enable_querying
++                   ? std::make_unique<BonjourQuerierImpl>(task_runner,
++                                                         reporting_client,
++                                                         config.network_info)
++                   : nullptr),
++      publisher_(config.enable_publication
 +                     ? std::make_unique<BonjourPublisherImpl>(
 +                           task_runner,
 +                           reporting_client,
@@ -510,10 +1287,10 @@ index 00000000..a26ab78a
 +}  // namespace openscreen::discovery
 diff --git a/discovery/dnssd/impl/bonjour_service_dispatcher.h b/discovery/dnssd/impl/bonjour_service_dispatcher.h
 new file mode 100644
-index 00000000..c8f31694
+index 00000000..bd12e46c
 --- /dev/null
 +++ b/discovery/dnssd/impl/bonjour_service_dispatcher.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,42 @@
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
@@ -523,6 +1300,7 @@ index 00000000..c8f31694
 +#include <memory>
 +
 +#include "discovery/dnssd/impl/bonjour_publisher_impl.h"
++#include "discovery/dnssd/impl/bonjour_querier_impl.h"
 +#include "discovery/dnssd/public/dns_sd_publisher.h"
 +#include "discovery/dnssd/public/dns_sd_querier.h"
 +#include "discovery/dnssd/public/dns_sd_service.h"
@@ -543,10 +1321,11 @@ index 00000000..c8f31694
 +                           const Config& config);
 +  ~BonjourServiceDispatcher() override;
 +
-+  DnsSdQuerier* GetQuerier() override { return nullptr; }
++  DnsSdQuerier* GetQuerier() override { return querier_.get(); }
 +  DnsSdPublisher* GetPublisher() override { return publisher_.get(); }
 +
 + private:
++  std::unique_ptr<BonjourQuerierImpl> querier_;
 +  std::unique_ptr<BonjourPublisherImpl> publisher_;
 +};
 +
