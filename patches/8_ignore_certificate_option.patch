@@ -1,0 +1,60 @@
+diff --git a/cast/sender/channel/sender_socket_factory.cc b/cast/sender/channel/sender_socket_factory.cc
+index 7a8d7485..e2697826 100644
+--- a/cast/sender/channel/sender_socket_factory.cc
++++ b/cast/sender/channel/sender_socket_factory.cc
+@@ -108,6 +108,17 @@ void SenderSocketFactory::OnConnected(
+                       std::move(peer_cert.value())});
+   PendingAuth& pending = *pending_auth_.back();
+ 
++  // If skip_authentication_ is set, bypass the auth challenge and connect directly.
++  if (skip_authentication_) {
++    OSP_LOG_WARN << "Skipping certificate authentication for " << endpoint
++                 << " (development mode)";
++    pending.socket->SetClient(pending.client);
++    client_.OnConnected(this, pending.endpoint,
++                        std::unique_ptr<CastSocket>(pending.socket.release()));
++    pending_auth_.pop_back();
++    return;
++  }
++
+   CastMessage auth_challenge =
+       CreateAuthChallengeMessage(*pending.auth_context);
+   Error error = pending.socket->Send(auth_challenge);
+diff --git a/cast/sender/public/sender_socket_factory.h b/cast/sender/public/sender_socket_factory.h
+index a0878a56..1863b8ab 100644
+--- a/cast/sender/public/sender_socket_factory.h
++++ b/cast/sender/public/sender_socket_factory.h
+@@ -56,6 +56,9 @@ class SenderSocketFactory final : public TlsConnectionFactory::Client,
+   // `factory` cannot be nullptr and must outlive `this`.
+   void set_factory(TlsConnectionFactory* factory);
+ 
++  // Skips certificate authentication (for development/testing only).
++  void set_skip_authentication(bool skip) { skip_authentication_ = skip; }
++
+   // Begins connecting to a Cast device at `endpoint`.  If a successful
+   // connection is made, including device authentication, the new CastSocket
+   // will be passed to `client_`'s OnConnected method.  The new CastSocket will
+@@ -113,6 +116,9 @@ class SenderSocketFactory final : public TlsConnectionFactory::Client,
+   // Trust stores for use with AuthenticateChallengeReply.
+   std::unique_ptr<TrustStore> cast_trust_store_;
+   std::unique_ptr<TrustStore> crl_trust_store_;
++
++  // When true, skips certificate authentication (for development/testing).
++  bool skip_authentication_ = false;
+ };
+ 
+ }  // namespace openscreen::cast
+diff --git a/cast/standalone_sender/my_lib.h b/cast/standalone_sender/my_lib.h
+index b5005117..f5102a2b 100644
+--- a/cast/standalone_sender/my_lib.h
++++ b/cast/standalone_sender/my_lib.h
+@@ -103,6 +103,9 @@ typedef struct {
+ 
+   // Use Android RTP hack for older devices
+   bool use_android_rtp_hack;
++
++  // Skip certificate verification (for development/testing only)
++  bool ignore_certificate;
+ } CastSenderConfig;
+ 
+ // ============================================================================

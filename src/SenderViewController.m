@@ -37,6 +37,7 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
 @property (nonatomic, strong) NSTextField* interfaceField;
 @property (nonatomic, strong) NSTextField* certPathField;
 @property (nonatomic, strong) NSButton* certBrowseButton;
+@property (nonatomic, strong) NSButton* ignoreCertCheckbox;
 
 @property (nonatomic, strong) NSMutableArray<DiscoveredReceiver*>* discoveredReceivers;
 @property (nonatomic, assign) CastSender* sender;
@@ -104,6 +105,12 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
     self.certBrowseButton.target = self;
     self.certBrowseButton.action = @selector(browseForCertificate:);
     [view addSubview:self.certBrowseButton];
+
+    self.ignoreCertCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(390, y, 110, 22)];
+    self.ignoreCertCheckbox.title = @"Ignore Cert";
+    [self.ignoreCertCheckbox setButtonType:NSButtonTypeSwitch];
+    self.ignoreCertCheckbox.state = NSControlStateValueOff;
+    [view addSubview:self.ignoreCertCheckbox];
     y -= 30;
 
     // Discovered receivers table
@@ -213,10 +220,12 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
 
     NSString* interface = self.interfaceField.stringValue;
     NSString* certPath = self.certPathField.stringValue;
+    BOOL ignoreCert = (self.ignoreCertCheckbox.state == NSControlStateValueOn);
 
     CastSenderConfig config = {
         .interface_name = interface.UTF8String,
         .developer_certificate_path = certPath.length > 0 ? certPath.UTF8String : NULL,
+        .ignore_certificate = ignoreCert,
     };
 
     CastSenderCallbacks callbacks = {
