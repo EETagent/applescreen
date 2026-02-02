@@ -1351,10 +1351,10 @@ index 00000000..3ffa2e29
 +
 +#endif  // CAST_STANDALONE_RECEIVER_MY_LIB_H_
 diff --git a/cast/standalone_sender/my_lib.cc b/cast/standalone_sender/my_lib.cc
-index 29751036..91e12057 100644
+index 29751036..5b181f10 100644
 --- a/cast/standalone_sender/my_lib.cc
 +++ b/cast/standalone_sender/my_lib.cc
-@@ -1,4 +1,1010 @@
+@@ -1,4 +1,1173 @@
 -extern "C" __attribute__((visibility("default"))) int todo(int argc,
 -                                                            char* argv[]) {
 +// Copyright 2024 The Chromium Authors
@@ -1365,14 +1365,11 @@ index 29751036..91e12057 100644
 +
 +#include <algorithm>
 +#include <atomic>
-+#include <condition_variable>
 +#include <cstring>
++#include <future>
 +#include <memory>
 +#include <mutex>
-+#include <optional>
-+#include <string>
 +#include <thread>
-+#include <vector>
 +
 +#include "cast/common/channel/cast_socket_message_port.h"
 +#include "cast/common/channel/connection_namespace_handler.h"
@@ -1521,6 +1518,8 @@ index 29751036..91e12057 100644
 +  void OnReceiverMessagingOpened(bool success);
 +  void CreateAndStartSession();
 +  void Shutdown();
++  int SendVideoFrameOnTaskRunner(const SenderVideoFrame& frame);
++  int SendAudioSamplesOnTaskRunner(const SenderAudioSamples& samples);
 +
 +  void RunThread();
 +
@@ -1531,6 +1530,9 @@ index 29751036..91e12057 100644
 +  std::atomic<bool> running_{false};
 +  std::atomic<bool> connected_{false};
 +  std::atomic<bool> discovering_{false};
++
++  std::mutex video_mutex_;
++  std::mutex audio_mutex_;
 +
 +  TaskRunnerImpl* task_runner_ = nullptr;
 +  std::unique_ptr<ReceiverDiscovery> discovery_;
@@ -1558,6 +1560,16 @@ index 29751036..91e12057 100644
 +  std::unique_ptr<StreamingVideoEncoder> video_encoder_;
 +  std::unique_ptr<StreamingOpusEncoder> audio_encoder_;
 +#endif
++
++  Clock::time_point video_base_time_ = Clock::time_point::min();
++  int64_t video_base_capture_us_ = 0;
++  Clock::time_point audio_base_time_ = Clock::time_point::min();
++  int64_t audio_base_capture_us_ = 0;
++
++  // Shared A/V sync: the wall-clock time when streaming started
++  std::atomic<bool> av_sync_initialized_{false};
++  Clock::time_point av_sync_epoch_ = Clock::time_point::min();
++  std::mutex av_sync_mutex_;
 +};
 +
 +ReceiverDiscovery::ReceiverDiscovery(const InterfaceInfo& interface,
@@ -1711,6 +1723,7 @@ index 29751036..91e12057 100644
 +
 +  socket_factory_ = std::make_unique<SenderSocketFactory>(
 +      *this, *task_runner_, std::move(trust_store_), CastCRLTrustStore::Create());
++  socket_factory_->set_skip_authentication(config_.ignore_certificate);
 +  connection_factory_ =
 +      TlsConnectionFactory::CreateFactory(*socket_factory_, *task_runner_);
 +  socket_factory_->set_factory(connection_factory_.get());
@@ -2012,9 +2025,11 @@ index 29751036..91e12057 100644
 +}
 +
 +void CastSenderImpl::CreateAndStartSession() {
++  // Use port 0 to let the OS assign an ephemeral port.
++  // Do NOT use kDefaultCastStreamingPort as it may conflict with the receiver.
 +  environment_ = std::make_unique<Environment>(
 +      &Clock::now, *task_runner_,
-+      IPEndpoint{pending_endpoint_.address, kDefaultCastStreamingPort});
++      IPEndpoint{pending_endpoint_.address, 0});
 +
 +  SenderSession::Configuration session_config{
 +      .remote_address = pending_endpoint_.address,
@@ -2116,9 +2131,69 @@ index 29751036..91e12057 100644
 +
 +int CastSenderImpl::SendVideoFrame(const SenderVideoFrame& frame) {
 +#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++  if (!task_runner_) {
++    return -1;
++  }
++
++  if (!task_runner_->IsRunningOnTaskRunner()) {
++    auto promise = std::make_shared<std::promise<int>>();
++    auto future = promise->get_future();
++    const SenderVideoFrame frame_copy = frame;
++    task_runner_->PostTask([this, frame_copy, promise]() mutable {
++      promise->set_value(SendVideoFrameOnTaskRunner(frame_copy));
++    });
++    return future.get();
++  }
++
++  return SendVideoFrameOnTaskRunner(frame);
++#else
++  return -1;
++#endif
++}
++
++int CastSenderImpl::SendVideoFrameOnTaskRunner(const SenderVideoFrame& frame) {
++#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++  std::lock_guard<std::mutex> lock(video_mutex_);
 +  if (!video_encoder_ || !connected_.load()) {
 +    return -1;
 +  }
++
++  // Initialize shared A/V sync epoch on first frame (video or audio)
++  {
++    std::lock_guard<std::mutex> sync_lock(av_sync_mutex_);
++    if (av_sync_epoch_ == Clock::time_point::min()) {
++      av_sync_epoch_ = Clock::now();
++      av_sync_initialized_.store(true);
++    }
++  }
++
++  if (video_base_time_ == Clock::time_point::min()) {
++    video_base_time_ = av_sync_epoch_;
++    video_base_capture_us_ = frame.capture_begin_time_us;
++    if (video_base_capture_us_ == 0) {
++      video_base_capture_us_ = frame.capture_end_time_us;
++    }
++  }
++
++  int64_t begin_us = frame.capture_begin_time_us;
++  int64_t end_us = frame.capture_end_time_us;
++  if (begin_us == 0 && end_us > 0 && frame.duration_us > 0) {
++    begin_us = end_us - frame.duration_us;
++  }
++  if (end_us == 0 && begin_us > 0 && frame.duration_us > 0) {
++    end_us = begin_us + frame.duration_us;
++  }
++  if (begin_us < video_base_capture_us_) {
++    begin_us = video_base_capture_us_;
++  }
++  if (end_us < begin_us) {
++    end_us = begin_us + frame.duration_us;
++  }
++
++  const auto begin_delta = std::chrono::microseconds(begin_us - video_base_capture_us_);
++  const auto end_delta = std::chrono::microseconds(end_us - video_base_capture_us_);
++  const Clock::time_point capture_begin = video_base_time_ + begin_delta;
++  const Clock::time_point capture_end = video_base_time_ + end_delta;
 +
 +  StreamingVideoEncoder::VideoFrame encoder_frame;
 +  encoder_frame.width = frame.width;
@@ -2130,12 +2205,10 @@ index 29751036..91e12057 100644
 +  encoder_frame.yuv_strides[1] = frame.u_stride;
 +  encoder_frame.yuv_strides[2] = frame.v_stride;
 +  encoder_frame.duration = std::chrono::microseconds(frame.duration_us);
-+  encoder_frame.capture_begin_time =
-+      Clock::time_point(std::chrono::microseconds(frame.capture_begin_time_us));
-+  encoder_frame.capture_end_time =
-+      Clock::time_point(std::chrono::microseconds(frame.capture_end_time_us));
++  encoder_frame.capture_begin_time = capture_begin;
++  encoder_frame.capture_end_time = capture_end;
 +
-+  Clock::time_point reference_time = Clock::now();
++  Clock::time_point reference_time = capture_end;
 +
 +  std::function<void(StreamingVideoEncoder::Stats)> stats_callback = nullptr;
 +  if (callbacks_.on_encoder_stats) {
@@ -2163,15 +2236,94 @@ index 29751036..91e12057 100644
 +
 +int CastSenderImpl::SendAudioSamples(const SenderAudioSamples& samples) {
 +#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++  if (!task_runner_) {
++    return -1;
++  }
++
++  if (!task_runner_->IsRunningOnTaskRunner()) {
++    auto promise = std::make_shared<std::promise<int>>();
++    auto future = promise->get_future();
++    const SenderAudioSamples samples_copy = samples;
++    task_runner_->PostTask([this, samples_copy, promise]() mutable {
++      promise->set_value(SendAudioSamplesOnTaskRunner(samples_copy));
++    });
++    return future.get();
++  }
++
++  return SendAudioSamplesOnTaskRunner(samples);
++#else
++  return -1;
++#endif
++}
++
++int CastSenderImpl::SendAudioSamplesOnTaskRunner(
++    const SenderAudioSamples& samples) {
++#if defined(CAST_STANDALONE_SENDER_HAVE_EXTERNAL_LIBS)
++  std::lock_guard<std::mutex> lock(audio_mutex_);
 +  if (!audio_encoder_ || !connected_.load()) {
 +    return -1;
 +  }
 +
-+  Clock::time_point capture_begin =
-+      Clock::time_point(std::chrono::microseconds(samples.capture_begin_time_us));
-+  Clock::time_point capture_end =
-+      Clock::time_point(std::chrono::microseconds(samples.capture_end_time_us));
-+  Clock::time_point reference_time = Clock::now();
++  // Initialize shared A/V sync epoch on first frame (video or audio)
++  {
++    std::lock_guard<std::mutex> sync_lock(av_sync_mutex_);
++    if (av_sync_epoch_ == Clock::time_point::min()) {
++      av_sync_epoch_ = Clock::now();
++      av_sync_initialized_.store(true);
++    }
++  }
++
++  const int sample_rate = config_.audio_sample_rate > 0
++                              ? config_.audio_sample_rate
++                              : kDefaultAudioSampleRate;
++  const int64_t duration_us = samples.num_samples * 1000000LL / sample_rate;
++
++  if (audio_base_time_ == Clock::time_point::min()) {
++    audio_base_time_ = av_sync_epoch_;
++    // Use source PTS if available, otherwise use current time offset
++    audio_base_capture_us_ = samples.capture_begin_time_us;
++    if (audio_base_capture_us_ == 0) {
++      audio_base_capture_us_ = samples.capture_end_time_us > 0
++          ? samples.capture_end_time_us - duration_us
++          : 0;
++    }
++  }
++
++  // Use source PTS to compute timestamps relative to the shared epoch
++  int64_t begin_us = samples.capture_begin_time_us;
++  int64_t end_us = samples.capture_end_time_us;
++
++  // Handle missing timestamps
++  if (begin_us == 0 && end_us > 0) {
++    begin_us = end_us - duration_us;
++  }
++  if (end_us == 0 && begin_us > 0) {
++    end_us = begin_us + duration_us;
++  }
++  // If both are zero, fall back to wall clock progression
++  if (begin_us == 0 && end_us == 0) {
++    auto now = Clock::now();
++    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
++        now - audio_base_time_);
++    begin_us = audio_base_capture_us_ + elapsed.count();
++    end_us = begin_us + duration_us;
++  }
++
++  // Clamp to valid range
++  if (begin_us < audio_base_capture_us_) {
++    begin_us = audio_base_capture_us_;
++  }
++  if (end_us < begin_us) {
++    end_us = begin_us + duration_us;
++  }
++
++  const auto begin_delta = std::chrono::microseconds(begin_us - audio_base_capture_us_);
++  const auto end_delta = std::chrono::microseconds(end_us - audio_base_capture_us_);
++  const Clock::time_point capture_begin = audio_base_time_ + begin_delta;
++  const Clock::time_point capture_end = audio_base_time_ + end_delta;
++
++  // Use capture_end as the reference time
++  const Clock::time_point reference_time = capture_end;
 +
 +  audio_encoder_->EncodeAndSend(samples.samples, samples.num_samples,
 +                                capture_begin, capture_end, reference_time);
@@ -2222,6 +2374,17 @@ index 29751036..91e12057 100644
 +  platform_remote_connection_.reset();
 +  has_launched_ = false;
 +  connected_.store(false);
++
++  // Reset A/V sync state for next session
++  {
++    std::lock_guard<std::mutex> sync_lock(av_sync_mutex_);
++    av_sync_epoch_ = Clock::time_point::min();
++    av_sync_initialized_.store(false);
++  }
++  video_base_time_ = Clock::time_point::min();
++  video_base_capture_us_ = 0;
++  audio_base_time_ = Clock::time_point::min();
++  audio_base_capture_us_ = 0;
 +
 +  message_port_.SetSocket(WeakPtr<CastSocket>{});
 +}
