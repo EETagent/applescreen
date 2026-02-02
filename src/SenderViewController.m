@@ -4,6 +4,7 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include "cast/standalone_sender/my_lib.h"
 
@@ -44,6 +45,17 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
 @property (nonatomic, strong) SCStream* captureStream API_AVAILABLE(macos(12.3));
 @property (nonatomic, strong) SCContentFilter* captureFilter API_AVAILABLE(macos(12.3));
 @property (nonatomic, strong) dispatch_queue_t captureQueue;
+
+@property (nonatomic, strong) AVAssetReader* assetReader;
+@property (nonatomic, strong) AVAssetReaderTrackOutput* videoOutput;
+@property (nonatomic, strong) AVAssetReaderTrackOutput* audioOutput;
+@property (nonatomic, strong) dispatch_source_t playbackTimer;
+@property (nonatomic, assign) BOOL isPlayingFile;
+@property (nonatomic, assign) CMSampleBufferRef pendingVideoBuffer;
+@property (nonatomic, assign) CMSampleBufferRef pendingAudioBuffer;
+@property (nonatomic, assign) CMTime firstVideoPts;
+@property (nonatomic, assign) CMTime firstAudioPts;
+@property (nonatomic, assign) NSTimeInterval playbackStartTime;
 
 @end
 
@@ -387,17 +399,453 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
             }];
         }
     }
+    
+    [self stopFilePlayback];
+}
+
+- (void)stopFilePlayback {
+    self.isPlayingFile = NO;
+    
+    if (self.playbackTimer) {
+        dispatch_source_cancel(self.playbackTimer);
+        self.playbackTimer = nil;
+    }
+    
+    if (self.assetReader) {
+        [self.assetReader cancelReading];
+        self.assetReader = nil;
+    }
+    
+    self.videoOutput = nil;
+    self.audioOutput = nil;
+    [self clearPendingBuffers];
+}
+
+- (void)clearPendingBuffers {
+    if (self.pendingVideoBuffer) {
+        CFRelease(self.pendingVideoBuffer);
+        self.pendingVideoBuffer = NULL;
+    }
+    if (self.pendingAudioBuffer) {
+        CFRelease(self.pendingAudioBuffer);
+        self.pendingAudioBuffer = NULL;
+    }
+}
+
+- (BOOL)shouldSendSampleBuffer:(CMSampleBufferRef)sampleBuffer
+                     firstPts:(CMTime*)firstPts {
+    if (!sampleBuffer) {
+        return NO;
+    }
+
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    if (!CMTIME_IS_VALID(pts)) {
+        return YES;
+    }
+
+    if (!CMTIME_IS_VALID(*firstPts)) {
+        *firstPts = pts;
+    }
+
+    double offset = CMTimeGetSeconds(pts) - CMTimeGetSeconds(*firstPts);
+    if (offset < 0) {
+        offset = 0;
+    }
+
+    double now = CACurrentMediaTime();
+    double target = self.playbackStartTime + offset;
+    const double lead_seconds = 0.02;
+    return (now + lead_seconds) >= target;
+}
+
+#pragma mark - Video File Playback
+
+- (void)startVideoFilePlayback:(NSString*)filePath {
+    NSURL* fileURL = [NSURL fileURLWithPath:filePath];
+    AVAsset* asset = [AVAsset assetWithURL:fileURL];
+    
+    NSError* error = nil;
+    self.assetReader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
+    if (error) {
+        [self updateStatus:[NSString stringWithFormat:@"Failed to open video: %@", error.localizedDescription]];
+        return;
+    }
+    
+    NSArray<AVAssetTrack*>* videoTracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+    if (videoTracks.count > 0) {
+        AVAssetTrack* videoTrack = videoTracks.firstObject;
+        
+        NSDictionary* videoSettings = @{
+            (NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+            (NSString*)kCVPixelBufferWidthKey: @(1920),
+            (NSString*)kCVPixelBufferHeightKey: @(1080),
+        };
+        
+        self.videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:videoSettings];
+        self.videoOutput.alwaysCopiesSampleData = NO;
+        
+        if ([self.assetReader canAddOutput:self.videoOutput]) {
+            [self.assetReader addOutput:self.videoOutput];
+        }
+        
+        NSLog(@"Video track: %.0fx%.0f, fps=%.2f", 
+              videoTrack.naturalSize.width, videoTrack.naturalSize.height,
+              videoTrack.nominalFrameRate);
+    }
+    
+    NSArray<AVAssetTrack*>* audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
+    if (audioTracks.count > 0) {
+        AVAssetTrack* audioTrack = audioTracks.firstObject;
+        
+        NSDictionary* audioSettings = @{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVSampleRateKey: @(48000),
+            AVNumberOfChannelsKey: @(2),
+            AVLinearPCMBitDepthKey: @(32),
+            AVLinearPCMIsFloatKey: @YES,
+            AVLinearPCMIsBigEndianKey: @NO,
+            AVLinearPCMIsNonInterleaved: @NO,
+        };
+        
+        self.audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:audioSettings];
+        self.audioOutput.alwaysCopiesSampleData = NO;
+        
+        if ([self.assetReader canAddOutput:self.audioOutput]) {
+            [self.assetReader addOutput:self.audioOutput];
+        }
+        
+        NSLog(@"Audio track found");
+    }
+    
+    if (![self.assetReader startReading]) {
+        [self updateStatus:[NSString stringWithFormat:@"Failed to start reading: %@", self.assetReader.error.localizedDescription]];
+        return;
+    }
+
+    self.isPlayingFile = YES;
+    self.firstVideoPts = kCMTimeInvalid;
+    self.firstAudioPts = kCMTimeInvalid;
+    self.playbackStartTime = CACurrentMediaTime();
+    [self clearPendingBuffers];
+    
+    [self updateStatus:@"Streaming video file..."];
+    
+    // Start playback timer - process frames at ~30fps for video
+    self.playbackTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.captureQueue);
+    dispatch_source_set_timer(self.playbackTimer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 30, NSEC_PER_SEC / 60);
+    
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(self.playbackTimer, ^{
+        [weakSelf processNextFrames];
+    });
+    
+    dispatch_resume(self.playbackTimer);
+}
+
+- (void)processNextFrames {
+    if (!self.isPlayingFile || !self.connected || !self.sender) {
+        return;
+    }
+
+    // Process video frame
+    if (self.videoOutput && self.assetReader.status == AVAssetReaderStatusReading) {
+        if (!self.pendingVideoBuffer) {
+            self.pendingVideoBuffer = [self.videoOutput copyNextSampleBuffer];
+        }
+        if (self.pendingVideoBuffer) {
+            if ([self shouldSendSampleBuffer:self.pendingVideoBuffer firstPts:&_firstVideoPts]) {
+                [self processVideoSampleBuffer:self.pendingVideoBuffer];
+                CFRelease(self.pendingVideoBuffer);
+                self.pendingVideoBuffer = NULL;
+            }
+        }
+    }
+
+    if (self.audioOutput && self.assetReader.status == AVAssetReaderStatusReading) {
+        for (int i = 0; i < 5; i++) {
+            if (!self.pendingAudioBuffer) {
+                self.pendingAudioBuffer = [self.audioOutput copyNextSampleBuffer];
+            }
+            if (!self.pendingAudioBuffer) {
+                break;
+            }
+            if ([self shouldSendSampleBuffer:self.pendingAudioBuffer firstPts:&_firstAudioPts]) {
+                [self processAudioSampleBuffer:self.pendingAudioBuffer];
+                CFRelease(self.pendingAudioBuffer);
+                self.pendingAudioBuffer = NULL;
+            } else {
+                break;
+            }
+        }
+    }
+    
+    if (self.assetReader.status == AVAssetReaderStatusCompleted) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateStatus:@"Video playback completed"];
+            [self stopFilePlayback];
+        });
+    } else if (self.assetReader.status == AVAssetReaderStatusFailed) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateStatus:[NSString stringWithFormat:@"Playback failed: %@", self.assetReader.error.localizedDescription]];
+            [self stopFilePlayback];
+        });
+    }
+}
+
+- (void)processVideoSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    static int frameCount = 0;
+    frameCount++;
+    
+    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!imageBuffer) return;
+    
+    CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+    
+    size_t width = CVPixelBufferGetWidth(imageBuffer);
+    size_t height = CVPixelBufferGetHeight(imageBuffer);
+    OSType pixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer);
+    
+    if (frameCount <= 5) {
+        NSLog(@"Video file frame %d: %zux%zu format=0x%x", frameCount, width, height, (unsigned int)pixelFormat);
+    }
+    
+    if (pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+        pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+        
+        // Get Y plane
+        uint8_t* yPlane = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 0);
+        size_t yBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 0);
+        
+        uint8_t* uvPlane = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 1);
+        size_t uvBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1);
+        
+        size_t uvWidth = width / 2;
+        size_t uvHeight = height / 2;
+        uint8_t* uPlane = malloc(uvWidth * uvHeight);
+        uint8_t* vPlane = malloc(uvWidth * uvHeight);
+        
+        for (size_t row = 0; row < uvHeight; row++) {
+            uint8_t* uvRow = uvPlane + row * uvBytesPerRow;
+            uint8_t* uRow = uPlane + row * uvWidth;
+            uint8_t* vRow = vPlane + row * uvWidth;
+            for (size_t col = 0; col < uvWidth; col++) {
+                uRow[col] = uvRow[col * 2];      // Cb (U)
+                vRow[col] = uvRow[col * 2 + 1];  // Cr (V)
+            }
+        }
+        
+        uint64_t now_us = (uint64_t)(CACurrentMediaTime() * 1000000.0);
+        CMTime duration = CMSampleBufferGetDuration(sampleBuffer);
+        int64_t duration_us = CMTIME_IS_VALID(duration) ? (int64_t)(CMTimeGetSeconds(duration) * 1000000) : 33333;
+        
+        SenderVideoFrame frame = {
+            .width = (int)width,
+            .height = (int)height,
+            .y_plane = yPlane,
+            .u_plane = uPlane,
+            .v_plane = vPlane,
+            .y_stride = (int)yBytesPerRow,
+            .u_stride = (int)uvWidth,
+            .v_stride = (int)uvWidth,
+            .duration_us = duration_us,
+            .capture_begin_time_us = now_us,
+            .capture_end_time_us = now_us + duration_us,
+        };
+        
+        int result = cast_sender_send_video_frame(self.sender, &frame);
+        if (frameCount <= 5 || frameCount % 30 == 1) {
+            NSLog(@"Video file frame %d: sent to cast, result=%d", frameCount, result);
+        }
+        
+        free(uPlane);
+        free(vPlane);
+    }
+    
+    CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+}
+
+- (void)processAudioSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    static int audioFrameCount = 0;
+    audioFrameCount++;
+
+    uint64_t now_us = (uint64_t)(CACurrentMediaTime() * 1000000.0);
+
+    CMItemCount numSamples = CMSampleBufferGetNumSamples(sampleBuffer);
+    if (numSamples <= 0) return;
+
+    CMAudioFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
+    const AudioStreamBasicDescription* asbd =
+        CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc);
+    if (!asbd) return;
+
+    if (audioFrameCount <= 5) {
+        NSLog(@"Audio frame %d: samples=%ld rate=%.0f channels=%u format=0x%x",
+              audioFrameCount, (long)numSamples, asbd->mSampleRate,
+              (unsigned int)asbd->mChannelsPerFrame, (unsigned int)asbd->mFormatID);
+    }
+
+    AudioBufferList bufferList;
+    CMBlockBufferRef blockBuffer = NULL;
+    OSStatus status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sampleBuffer,
+        NULL,
+        &bufferList,
+        sizeof(bufferList),
+        NULL,
+        NULL,
+        0,
+        &blockBuffer);
+    if (status != noErr) {
+        if (blockBuffer) CFRelease(blockBuffer);
+        return;
+    }
+
+    if (bufferList.mNumberBuffers < 1) {
+        if (blockBuffer) CFRelease(blockBuffer);
+        return;
+    }
+
+    AudioBuffer audioBuffer = bufferList.mBuffers[0];
+    if (!audioBuffer.mData) {
+        if (blockBuffer) CFRelease(blockBuffer);
+        return;
+    }
+
+    float* floatSamples = (float*)audioBuffer.mData;
+    int numSamplesPerChannel = (int)numSamples;
+    int64_t duration_us = (int64_t)numSamplesPerChannel * 1000000 / (int64_t)asbd->mSampleRate;
+
+    SenderAudioSamples audioSamples = {
+        .samples = floatSamples,
+        .num_samples = numSamplesPerChannel,
+        .capture_begin_time_us = now_us,
+        .capture_end_time_us = now_us + duration_us,
+    };
+
+    cast_sender_send_audio_samples(self.sender, &audioSamples);
+
+    if (blockBuffer) CFRelease(blockBuffer);
+}
+
+#pragma mark - Audio File Playback
+
+- (void)startAudioFilePlayback:(NSString*)filePath {
+    NSURL* fileURL = [NSURL fileURLWithPath:filePath];
+    AVAsset* asset = [AVAsset assetWithURL:fileURL];
+    
+    NSError* error = nil;
+    self.assetReader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
+    if (error) {
+        [self updateStatus:[NSString stringWithFormat:@"Failed to open audio: %@", error.localizedDescription]];
+        return;
+    }
+    
+    NSArray<AVAssetTrack*>* audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
+    if (audioTracks.count == 0) {
+        [self updateStatus:@"No audio track found in file"];
+        return;
+    }
+    
+    AVAssetTrack* audioTrack = audioTracks.firstObject;
+    
+    NSDictionary* audioSettings = @{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVSampleRateKey: @(48000),
+        AVNumberOfChannelsKey: @(2),
+        AVLinearPCMBitDepthKey: @(32),
+        AVLinearPCMIsFloatKey: @YES,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVLinearPCMIsNonInterleaved: @NO,
+    };
+    
+    self.audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:audioSettings];
+    self.audioOutput.alwaysCopiesSampleData = NO;
+    
+    if ([self.assetReader canAddOutput:self.audioOutput]) {
+        [self.assetReader addOutput:self.audioOutput];
+    }
+    
+    if (![self.assetReader startReading]) {
+        [self updateStatus:[NSString stringWithFormat:@"Failed to start reading: %@", self.assetReader.error.localizedDescription]];
+        return;
+    }
+
+    self.isPlayingFile = YES;
+    self.videoOutput = nil;  // No video for audio-only
+    self.firstVideoPts = kCMTimeInvalid;
+    self.firstAudioPts = kCMTimeInvalid;
+    self.playbackStartTime = CACurrentMediaTime();
+    [self clearPendingBuffers];
+    
+    [self updateStatus:@"Streaming audio file..."];
+    
+    self.playbackTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.captureQueue);
+    dispatch_source_set_timer(self.playbackTimer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 100, NSEC_PER_SEC / 200);
+    
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(self.playbackTimer, ^{
+        [weakSelf processAudioOnlyFrames];
+    });
+    
+    dispatch_resume(self.playbackTimer);
+}
+
+- (void)processAudioOnlyFrames {
+    if (!self.isPlayingFile || !self.connected || !self.sender) {
+        return;
+    }
+
+    if (self.audioOutput && self.assetReader.status == AVAssetReaderStatusReading) {
+        for (int i = 0; i < 5; i++) {
+            if (!self.pendingAudioBuffer) {
+                self.pendingAudioBuffer = [self.audioOutput copyNextSampleBuffer];
+            }
+            if (!self.pendingAudioBuffer) {
+                break;
+            }
+            if ([self shouldSendSampleBuffer:self.pendingAudioBuffer firstPts:&_firstAudioPts]) {
+                [self processAudioSampleBuffer:self.pendingAudioBuffer];
+                CFRelease(self.pendingAudioBuffer);
+                self.pendingAudioBuffer = NULL;
+            } else {
+                break;
+            }
+        }
+    }
+    
+    if (self.assetReader.status == AVAssetReaderStatusCompleted) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateStatus:@"Audio playback completed"];
+            [self stopFilePlayback];
+        });
+    } else if (self.assetReader.status == AVAssetReaderStatusFailed) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateStatus:[NSString stringWithFormat:@"Playback failed: %@", self.assetReader.error.localizedDescription]];
+            [self stopFilePlayback];
+        });
+    }
 }
 
 #pragma mark - SCStreamOutput
 
 - (void)stream:(SCStream*)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type API_AVAILABLE(macos(12.3)) {
+    static int frameCount = 0;
+    frameCount++;
+    
+    if (frameCount <= 5 || frameCount % 30 == 1) {
+        NSLog(@"SCStream frame %d: type=%d connected=%d sender=%p", 
+              frameCount, (int)type, self.connected, self.sender);
+    }
+    
     if (type != SCStreamOutputTypeScreen || !self.connected || !self.sender) {
         return;
     }
 
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (!imageBuffer) return;
+    if (!imageBuffer) {
+        NSLog(@"SCStream frame %d: no imageBuffer!", frameCount);
+        return;
+    }
 
     CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
 
@@ -406,6 +854,10 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
 
     // Handle NV12 (biplanar) to YUV420P conversion
     OSType pixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer);
+    
+    if (frameCount <= 5) {
+        NSLog(@"SCStream frame %d: %zux%zu format=0x%x", frameCount, width, height, (unsigned int)pixelFormat);
+    }
 
     if (pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
         pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
@@ -453,7 +905,10 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
             .capture_end_time_us = pts_us,
         };
 
-        cast_sender_send_video_frame(self.sender, &frame);
+        int result = cast_sender_send_video_frame(self.sender, &frame);
+        if (frameCount <= 5 || frameCount % 30 == 1) {
+            NSLog(@"SCStream frame %d: sent to cast, result=%d", frameCount, result);
+        }
 
         free(uPlane);
         free(vPlane);
@@ -523,8 +978,21 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
             } else {
                 [self updateStatus:@"Screen capture requires macOS 12.3+"];
             }
+        } else if (sourceIndex == 1) {  // Video File
+            NSString* filePath = self.filePathField.stringValue;
+            if (filePath.length == 0) {
+                [self updateStatus:@"Please select a video file first"];
+                return;
+            }
+            [self startVideoFilePlayback:filePath];
+        } else if (sourceIndex == 2) {  // Audio File
+            NSString* filePath = self.filePathField.stringValue;
+            if (filePath.length == 0) {
+                [self updateStatus:@"Please select an audio file first"];
+                return;
+            }
+            [self startAudioFilePlayback:filePath];
         }
-        // TODO: Handle video/audio file sources
     });
 }
 
