@@ -5,8 +5,14 @@
 #import <AVFoundation/AVFoundation.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Accelerate/Accelerate.h>
 
 #include "cast/standalone_sender/my_lib.h"
+
+// Pre-allocated buffer pool for UV plane conversion (supports up to 4K)
+static const size_t kMaxBufferWidth = 3840;
+static const size_t kMaxBufferHeight = 2160;
+static const size_t kUVBufferSize = (kMaxBufferWidth / 2) * (kMaxBufferHeight / 2);
 
 @interface DiscoveredReceiver : NSObject
 @property (nonatomic, copy) NSString* uniqueId;
@@ -57,6 +63,21 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
 @property (nonatomic, assign) CMTime firstVideoPts;
 @property (nonatomic, assign) CMTime firstAudioPts;
 @property (nonatomic, assign) NSTimeInterval playbackStartTime;
+@property (nonatomic, assign) int64_t lastVideoPtsUs;
+@property (nonatomic, assign) int64_t lastAudioPtsUs;
+
+// Pre-allocated buffer pool for UV plane conversion
+@property (nonatomic, assign) uint8_t* uPlaneBuffer;
+@property (nonatomic, assign) uint8_t* vPlaneBuffer;
+
+// Frame counters (instance variables for proper reset)
+@property (nonatomic, assign) int videoFrameCount;
+@property (nonatomic, assign) int audioFrameCount;
+@property (nonatomic, assign) int screenFrameCount;
+
+// Shared A/V sync: first PTS for the entire session
+@property (nonatomic, assign) CMTime sessionFirstPts;
+@property (nonatomic, assign) BOOL sessionSyncInitialized;
 
 @end
 
@@ -66,6 +87,11 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
     self.view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 500, 380)];
     self.discoveredReceivers = [NSMutableArray array];
     self.captureQueue = dispatch_queue_create("com.cast.sender.capture", DISPATCH_QUEUE_SERIAL);
+    
+    // Pre-allocate UV plane buffers (supports up to 4K)
+    self.uPlaneBuffer = (uint8_t*)malloc(kUVBufferSize);
+    self.vPlaneBuffer = (uint8_t*)malloc(kUVBufferSize);
+    
     [self setupUI];
 }
 
@@ -355,6 +381,9 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
 #pragma mark - Screen Capture
 
 - (void)startScreenCapture API_AVAILABLE(macos(12.3)) {
+    // Reset frame counter for new capture session
+    self.screenFrameCount = 0;
+    
     [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent* content, NSError* error) {
         if (error) {
             [self updateStatus:[NSString stringWithFormat:@"Capture error: %@", error.localizedDescription]];
@@ -409,6 +438,9 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
         }
     }
     
+    // Reset screen capture state
+    self.screenFrameCount = 0;
+    
     [self stopFilePlayback];
 }
 
@@ -428,6 +460,12 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
     self.videoOutput = nil;
     self.audioOutput = nil;
     [self clearPendingBuffers];
+    
+    // Reset sync state
+    self.sessionFirstPts = kCMTimeInvalid;
+    self.sessionSyncInitialized = NO;
+    self.lastVideoPtsUs = -1;
+    self.lastAudioPtsUs = -1;
 }
 
 - (void)clearPendingBuffers {
@@ -535,6 +573,12 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
     self.firstVideoPts = kCMTimeInvalid;
     self.firstAudioPts = kCMTimeInvalid;
     self.playbackStartTime = CACurrentMediaTime();
+    self.videoFrameCount = 0;
+    self.audioFrameCount = 0;
+    self.sessionFirstPts = kCMTimeInvalid;
+    self.sessionSyncInitialized = NO;
+    self.lastVideoPtsUs = -1;
+    self.lastAudioPtsUs = -1;
     [self clearPendingBuffers];
     
     [self updateStatus:@"Streaming video file..."];
@@ -553,6 +597,19 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
 
 - (void)processNextFrames {
     if (!self.isPlayingFile || !self.connected || !self.sender) {
+        return;
+    }
+    
+    // Safety check: if asset reader is in unexpected state, stop
+    if (self.assetReader.status != AVAssetReaderStatusReading &&
+        self.assetReader.status != AVAssetReaderStatusCompleted) {
+        if (self.assetReader.status == AVAssetReaderStatusFailed) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self updateStatus:[NSString stringWithFormat:@"Playback failed: %@", 
+                    self.assetReader.error.localizedDescription ?: @"Unknown error"]];
+                [self stopFilePlayback];
+            });
+        }
         return;
     }
 
@@ -602,8 +659,8 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
 }
 
 - (void)processVideoSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    static int frameCount = 0;
-    frameCount++;
+    self.videoFrameCount++;
+    int frameCount = self.videoFrameCount;
     
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!imageBuffer) return;
@@ -630,23 +687,92 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
         
         size_t uvWidth = width / 2;
         size_t uvHeight = height / 2;
-        uint8_t* uPlane = malloc(uvWidth * uvHeight);
-        uint8_t* vPlane = malloc(uvWidth * uvHeight);
         
-        for (size_t row = 0; row < uvHeight; row++) {
-            uint8_t* uvRow = uvPlane + row * uvBytesPerRow;
-            uint8_t* uRow = uPlane + row * uvWidth;
-            uint8_t* vRow = vPlane + row * uvWidth;
-            for (size_t col = 0; col < uvWidth; col++) {
-                uRow[col] = uvRow[col * 2];      // Cb (U)
-                vRow[col] = uvRow[col * 2 + 1];  // Cr (V)
+        // Use pre-allocated buffers if size fits, otherwise allocate
+        uint8_t* uPlane;
+        uint8_t* vPlane;
+        BOOL usePooledBuffers = (uvWidth * uvHeight <= kUVBufferSize) && self.uPlaneBuffer && self.vPlaneBuffer;
+        
+        if (usePooledBuffers) {
+            uPlane = self.uPlaneBuffer;
+            vPlane = self.vPlaneBuffer;
+        } else {
+            uPlane = malloc(uvWidth * uvHeight);
+            vPlane = malloc(uvWidth * uvHeight);
+        }
+        
+        // Deinterleave NV12 UV plane to separate U and V planes using Accelerate
+        // vImageConvert_ChunkyToPlanar8 efficiently splits interleaved data
+        const void* srcChannels[2] = { uvPlane, uvPlane + 1 };  // U starts at offset 0, V at offset 1
+        
+        vImage_Buffer uBuffer = {
+            .data = uPlane,
+            .width = uvWidth,
+            .height = uvHeight,
+            .rowBytes = uvWidth
+        };
+        vImage_Buffer vBuffer = {
+            .data = vPlane,
+            .width = uvWidth,
+            .height = uvHeight,
+            .rowBytes = uvWidth
+        };
+        const vImage_Buffer* destBuffers[2] = { &uBuffer, &vBuffer };
+        
+        vImage_Error err = vImageConvert_ChunkyToPlanar8(
+            srcChannels,
+            destBuffers,
+            2,                    // channelCount: U and V
+            2,                    // srcStrideBytes: 2 bytes per pixel (UV interleaved)
+            uvWidth,              // srcWidth
+            uvHeight,             // srcHeight
+            uvBytesPerRow,        // srcRowBytes
+            kvImageNoFlags
+        );
+        
+        if (err != kvImageNoError) {
+            NSLog(@"vImageConvert_ChunkyToPlanar8 failed with error: %ld, falling back to manual", (long)err);
+            // Fallback to manual deinterleaving
+            for (size_t row = 0; row < uvHeight; row++) {
+                const uint8_t* uvRow = uvPlane + row * uvBytesPerRow;
+                uint8_t* uRow = uPlane + row * uvWidth;
+                uint8_t* vRow = vPlane + row * uvWidth;
+                for (size_t col = 0; col < uvWidth; col++) {
+                    uRow[col] = uvRow[col * 2];      // Cb (U)
+                    vRow[col] = uvRow[col * 2 + 1];  // Cr (V)
+                }
             }
         }
         
-        uint64_t now_us = (uint64_t)(CACurrentMediaTime() * 1000000.0);
+        // Use source PTS for proper A/V sync
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        
+        // Initialize session sync on first frame
+        if (!self.sessionSyncInitialized && CMTIME_IS_VALID(pts)) {
+            self.sessionFirstPts = pts;
+            self.sessionSyncInitialized = YES;
+        }
+        
         CMTime duration = CMSampleBufferGetDuration(sampleBuffer);
         int64_t duration_us = CMTIME_IS_VALID(duration) ? (int64_t)(CMTimeGetSeconds(duration) * 1000000) : 33333;
+
+        // Compute PTS relative to session start (in microseconds)
+        int64_t pts_us;
+        if (CMTIME_IS_VALID(pts) && CMTIME_IS_VALID(self.sessionFirstPts)) {
+            double offset = CMTimeGetSeconds(pts) - CMTimeGetSeconds(self.sessionFirstPts);
+            pts_us = (int64_t)(offset * 1000000.0);
+            if (pts_us < 0) pts_us = 0;
+        } else if (self.lastVideoPtsUs >= 0) {
+            pts_us = self.lastVideoPtsUs + duration_us;
+        } else {
+            pts_us = 0;
+        }
         
+        if (self.lastVideoPtsUs >= 0 && pts_us < self.lastVideoPtsUs) {
+            pts_us = self.lastVideoPtsUs + (int64_t)duration_us;
+        }
+        self.lastVideoPtsUs = pts_us;
+
         SenderVideoFrame frame = {
             .width = (int)width,
             .height = (int)height,
@@ -657,8 +783,8 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
             .u_stride = (int)uvWidth,
             .v_stride = (int)uvWidth,
             .duration_us = duration_us,
-            .capture_begin_time_us = now_us,
-            .capture_end_time_us = now_us + duration_us,
+            .capture_begin_time_us = pts_us,
+            .capture_end_time_us = pts_us + duration_us,
         };
         
         int result = cast_sender_send_video_frame(self.sender, &frame);
@@ -666,18 +792,18 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
             NSLog(@"Video file frame %d: sent to cast, result=%d", frameCount, result);
         }
         
-        free(uPlane);
-        free(vPlane);
+        if (!usePooledBuffers) {
+            free(uPlane);
+            free(vPlane);
+        }
     }
     
     CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
 }
 
 - (void)processAudioSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    static int audioFrameCount = 0;
-    audioFrameCount++;
-
-    uint64_t now_us = (uint64_t)(CACurrentMediaTime() * 1000000.0);
+    self.audioFrameCount++;
+    int audioFrameCount = self.audioFrameCount;
 
     CMItemCount numSamples = CMSampleBufferGetNumSamples(sampleBuffer);
     if (numSamples <= 0) return;
@@ -720,15 +846,41 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
         return;
     }
 
+    // Get source PTS for proper A/V sync
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    
+    // Initialize session sync on first audio frame if not already done
+    if (!self.sessionSyncInitialized && CMTIME_IS_VALID(pts)) {
+        self.sessionFirstPts = pts;
+        self.sessionSyncInitialized = YES;
+    }
+
     float* floatSamples = (float*)audioBuffer.mData;
     int numSamplesPerChannel = (int)numSamples;
     int64_t duration_us = (int64_t)numSamplesPerChannel * 1000000 / (int64_t)asbd->mSampleRate;
+    
+    // Compute PTS relative to session start (in microseconds)
+    int64_t pts_us;
+    if (CMTIME_IS_VALID(pts) && CMTIME_IS_VALID(self.sessionFirstPts)) {
+        double offset = CMTimeGetSeconds(pts) - CMTimeGetSeconds(self.sessionFirstPts);
+        pts_us = (int64_t)(offset * 1000000.0);
+        if (pts_us < 0) pts_us = 0;
+    } else if (self.lastAudioPtsUs >= 0) {
+        pts_us = self.lastAudioPtsUs + duration_us;
+    } else {
+        pts_us = 0;
+    }
+
+    if (self.lastAudioPtsUs >= 0 && pts_us < self.lastAudioPtsUs) {
+        pts_us = self.lastAudioPtsUs + duration_us;
+    }
+    self.lastAudioPtsUs = pts_us;
 
     SenderAudioSamples audioSamples = {
         .samples = floatSamples,
         .num_samples = numSamplesPerChannel,
-        .capture_begin_time_us = now_us,
-        .capture_end_time_us = now_us + duration_us,
+        .capture_begin_time_us = pts_us,
+        .capture_end_time_us = pts_us + duration_us,
     };
 
     cast_sender_send_audio_samples(self.sender, &audioSamples);
@@ -784,6 +936,12 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
     self.firstVideoPts = kCMTimeInvalid;
     self.firstAudioPts = kCMTimeInvalid;
     self.playbackStartTime = CACurrentMediaTime();
+    self.videoFrameCount = 0;
+    self.audioFrameCount = 0;
+    self.sessionFirstPts = kCMTimeInvalid;
+    self.sessionSyncInitialized = NO;
+    self.lastVideoPtsUs = -1;
+    self.lastAudioPtsUs = -1;
     [self clearPendingBuffers];
     
     [self updateStatus:@"Streaming audio file..."];
@@ -838,8 +996,8 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
 #pragma mark - SCStreamOutput
 
 - (void)stream:(SCStream*)stream didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer ofType:(SCStreamOutputType)type API_AVAILABLE(macos(12.3)) {
-    static int frameCount = 0;
-    frameCount++;
+    self.screenFrameCount++;
+    int frameCount = self.screenFrameCount;
     
     if (frameCount <= 5 || frameCount % 30 == 1) {
         NSLog(@"SCStream frame %d: type=%d connected=%d sender=%p", 
@@ -879,20 +1037,60 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
         uint8_t* uvPlane = CVPixelBufferGetBaseAddressOfPlane(imageBuffer, 1);
         size_t uvBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(imageBuffer, 1);
 
-        // Allocate separate U and V planes
         size_t uvWidth = width / 2;
         size_t uvHeight = height / 2;
-        uint8_t* uPlane = malloc(uvWidth * uvHeight);
-        uint8_t* vPlane = malloc(uvWidth * uvHeight);
+        
+        // Use pre-allocated buffers if size fits
+        uint8_t* uPlane;
+        uint8_t* vPlane;
+        BOOL usePooledBuffers = (uvWidth * uvHeight <= kUVBufferSize) && self.uPlaneBuffer && self.vPlaneBuffer;
+        
+        if (usePooledBuffers) {
+            uPlane = self.uPlaneBuffer;
+            vPlane = self.vPlaneBuffer;
+        } else {
+            uPlane = malloc(uvWidth * uvHeight);
+            vPlane = malloc(uvWidth * uvHeight);
+        }
 
-        // Deinterleave UV to separate U and V
-        for (size_t row = 0; row < uvHeight; row++) {
-            uint8_t* uvRow = uvPlane + row * uvBytesPerRow;
-            uint8_t* uRow = uPlane + row * uvWidth;
-            uint8_t* vRow = vPlane + row * uvWidth;
-            for (size_t col = 0; col < uvWidth; col++) {
-                uRow[col] = uvRow[col * 2];      // Cb (U)
-                vRow[col] = uvRow[col * 2 + 1];  // Cr (V)
+        // Deinterleave NV12 UV plane to separate U and V planes using Accelerate
+        const void* srcChannels[2] = { uvPlane, uvPlane + 1 };
+        
+        vImage_Buffer uBuffer = {
+            .data = uPlane,
+            .width = uvWidth,
+            .height = uvHeight,
+            .rowBytes = uvWidth
+        };
+        vImage_Buffer vBuffer = {
+            .data = vPlane,
+            .width = uvWidth,
+            .height = uvHeight,
+            .rowBytes = uvWidth
+        };
+        const vImage_Buffer* destBuffers[2] = { &uBuffer, &vBuffer };
+        
+        vImage_Error err = vImageConvert_ChunkyToPlanar8(
+            srcChannels,
+            destBuffers,
+            2,                    // channelCount: U and V
+            2,                    // srcStrideBytes: 2 bytes per pixel (UV interleaved)
+            uvWidth,              // srcWidth
+            uvHeight,             // srcHeight
+            uvBytesPerRow,        // srcRowBytes
+            kvImageNoFlags
+        );
+        
+        if (err != kvImageNoError) {
+            // Fallback to manual deinterleaving
+            for (size_t row = 0; row < uvHeight; row++) {
+                const uint8_t* uvRow = uvPlane + row * uvBytesPerRow;
+                uint8_t* uRow = uPlane + row * uvWidth;
+                uint8_t* vRow = vPlane + row * uvWidth;
+                for (size_t col = 0; col < uvWidth; col++) {
+                    uRow[col] = uvRow[col * 2];      // Cb (U)
+                    vRow[col] = uvRow[col * 2 + 1];  // Cr (V)
+                }
             }
         }
 
@@ -911,7 +1109,7 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
             .v_stride = (int)uvWidth,
             .duration_us = 33333,  // ~30fps
             .capture_begin_time_us = pts_us,
-            .capture_end_time_us = pts_us,
+            .capture_end_time_us = pts_us + 33333,
         };
 
         int result = cast_sender_send_video_frame(self.sender, &frame);
@@ -919,8 +1117,10 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
             NSLog(@"SCStream frame %d: sent to cast, result=%d", frameCount, result);
         }
 
-        free(uPlane);
-        free(vPlane);
+        if (!usePooledBuffers) {
+            free(uPlane);
+            free(vPlane);
+        }
     }
 
     CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
@@ -1058,6 +1258,15 @@ static void on_sender_error(void* user_data, int error_code, const char* error_m
     if (self.sender) {
         cast_sender_disconnect(self.sender);
         cast_sender_destroy(self.sender);
+    }
+    // Free pre-allocated buffers
+    if (self.uPlaneBuffer) {
+        free(self.uPlaneBuffer);
+        self.uPlaneBuffer = NULL;
+    }
+    if (self.vPlaneBuffer) {
+        free(self.vPlaneBuffer);
+        self.vPlaneBuffer = NULL;
     }
 }
 
