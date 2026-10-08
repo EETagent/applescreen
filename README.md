@@ -1,20 +1,21 @@
-WIP
+# Applescreen
 
+A native macOS Cast sender and receiver. Send a screen or an audio/video file;
+receive media using FFmpeg decoding and synchronized AVFoundation playback.
+The minimum deployment target is macOS 12.7.6.
 
-build requirements:
-- cmake
-- clang/xcode
-- nasm/yasm
-- ninja
-- make
-- google depot_tools in PATH
+The Cocoa application and all maintained integration code live here. One GN-built
+Cast core owns Open Screen for both roles, behind a private C/CF interface. CMake
+builds the application and orchestrates the pinned dependencies. FFmpeg, libaom,
+libvpx and Opus are built as static archives and linked into the core. Explicit
+universal packaging produces arm64 and x86_64 slices in both the app and core.
 
-appkit client
+- [Build, package, and run native tests](docs/build.md)
+- [Dependency lock](dependencies.lock.json)
+- [Upstream preservation and synchronization baseline](docs/upstream-baseline.md)
+- [Migration results, regression coverage, and remaining validation](docs/migration-report.md)
+- [Small generic upstream integration patches](patches/integration/README.md)
 
-<img width="1512" height="910" src="https://github.com/user-attachments/assets/d7c8fff7-ee3c-41ef-8494-3232c8b93f41" />
-
-sdl client
-
-<img width="439" height="309" src="https://github.com/user-attachments/assets/09f6a22e-75b2-4e88-bc43-5d753dfc678f" />
-
-<img width="1497" height="621" src="https://github.com/user-attachments/assets/03231819-1ce4-490a-abb2-2011897f6cd6" />
+Development receivers use an explicitly selected development CA with the normal
+Cast authentication challenge. See the build guide for credential generation;
+credentials are never generated automatically during a build.
