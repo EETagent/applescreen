@@ -1,0 +1,205 @@
+From 01ff4f48ae2ac02ebe87c03ccecb11279a252c19 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Vojt=C4=9Bch=20Jungmann?= <vojta.jungmann@gmail.com>
+Date: Thu, 8 Oct 2026 17:53:00 +0200
+Subject: [PATCH] Flush final Opus PCM and codec lookahead at end of input
+
+---
+ cast/standalone_sender/BUILD.gn               |  1 +
+ .../streaming_opus_encoder.cc                 | 28 ++++++
+ .../streaming_opus_encoder.h                  |  9 ++
+ .../streaming_opus_encoder_unittest.cc        | 91 +++++++++++++++++++
+ 4 files changed, 129 insertions(+)
+ create mode 100644 cast/standalone_sender/streaming_opus_encoder_unittest.cc
+
+diff --git a/cast/standalone_sender/BUILD.gn b/cast/standalone_sender/BUILD.gn
+index dbf13055..b9419c74 100644
+--- a/cast/standalone_sender/BUILD.gn
++++ b/cast/standalone_sender/BUILD.gn
+@@ -150,6 +150,7 @@ if (!build_with_chromium) {
+       sources += [
+         "looping_file_sender_unittest.cc",
+         "streaming_queue_unittest.cc",
++        "streaming_opus_encoder_unittest.cc",
+         "streaming_ffmpeg_encoder_unittest.cc",
+         "testing/fake_sender.h",
+       ]
+diff --git a/cast/standalone_sender/streaming_opus_encoder.cc b/cast/standalone_sender/streaming_opus_encoder.cc
+index 7e74df0a..b16fa247 100644
+--- a/cast/standalone_sender/streaming_opus_encoder.cc
++++ b/cast/standalone_sender/streaming_opus_encoder.cc
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <utility>
++#include <vector>
+ 
+ #include "platform/base/span.h"
+ #include "util/chrono_helpers.h"
+@@ -91,6 +92,10 @@ void StreamingOpusEncoder::EncodeAndSend(const float* interleaved_samples,
+   OSP_CHECK(interleaved_samples);
+   OSP_CHECK_GT(num_samples, 0);
+ 
++  flushed_ = false;
++  last_capture_begin_time_ = capture_begin_time;
++  last_capture_end_time_ = capture_end_time;
++
+   ResolveTimestampsAndMaybeSkip(reference_time);
+ 
+   while (num_samples > 0) {
+@@ -143,6 +148,29 @@ void StreamingOpusEncoder::EncodeAndSend(const float* interleaved_samples,
+   }
+ }
+ 
++void StreamingOpusEncoder::Flush() {
++  if (flushed_) {
++    return;
++  }
++  opus_int32 lookahead = 0;
++  OSP_CHECK_EQ(opus_encoder_ctl(encoder(), OPUS_GET_LOOKAHEAD(&lookahead)),
++               OPUS_OK);
++  // Opus retains lookahead even when the input ended on a packet boundary.
++  // Pad that delay as well, or the last real samples would remain unencoded.
++  const int remainder = (num_samples_queued_ + lookahead) % samples_per_cast_frame_;
++  const int padding = lookahead +
++      (remainder ? samples_per_cast_frame_ - remainder : 0);
++  if (padding > 0) {
++    const std::vector<float> silence(num_channels_ * padding, 0.0f);
++    const auto next_sample_time = frame_.reference_time + codec_delay_ +
++        RtpTimeDelta::FromTicks(num_samples_queued_)
++            .ToDuration<Clock::duration>(sample_rate());
++    EncodeAndSend(silence.data(), padding, last_capture_begin_time_,
++                  last_capture_end_time_, next_sample_time);
++  }
++  flushed_ = true;
++}
++
+ void StreamingOpusEncoder::UpdateCodecDelay() {
+   opus_int32 lookahead = 0;
+   const auto ctl_result =
+diff --git a/cast/standalone_sender/streaming_opus_encoder.h b/cast/standalone_sender/streaming_opus_encoder.h
+index b057ed0f..624401d9 100644
+--- a/cast/standalone_sender/streaming_opus_encoder.h
++++ b/cast/standalone_sender/streaming_opus_encoder.h
+@@ -64,6 +64,12 @@ class StreamingOpusEncoder {
+                      Clock::time_point capture_end_time,
+                      Clock::time_point reference_time);
+ 
++  // Ends the input by encoding the remaining PCM and codec lookahead, padding
++  // with silence to complete a codec packet. Preserves the media timeline and
++  // measured capture times. Repeated calls without new input do nothing.
++  // The normal Sender congestion/drop policy still applies to flushed packets.
++  void Flush();
++
+   static constexpr int kDefaultCastAudioFramesPerSecond =
+       100;  // 10 ms frame duration.
+ 
+@@ -98,6 +104,9 @@ class StreamingOpusEncoder {
+   // The number of mono/stereo tuples currently queued in the `input_` buffer.
+   // Multiply by `num_channels_` to get the number of array elements.
+   int num_samples_queued_ = 0;
++  bool flushed_ = true;
++  Clock::time_point last_capture_begin_time_;
++  Clock::time_point last_capture_end_time_;
+ 
+   // The reference time of the first frame passed to EncodeAndSend(), offset by
+   // the codec delay.
+diff --git a/cast/standalone_sender/streaming_opus_encoder_unittest.cc b/cast/standalone_sender/streaming_opus_encoder_unittest.cc
+new file mode 100644
+index 00000000..2326086f
+--- /dev/null
++++ b/cast/standalone_sender/streaming_opus_encoder_unittest.cc
+@@ -0,0 +1,91 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++#include "cast/standalone_sender/streaming_opus_encoder.h"
++
++#include <opus/opus.h>
++
++#include <cmath>
++#include <vector>
++
++#include "cast/standalone_sender/testing/fake_sender.h"
++#include "gtest/gtest.h"
++
++namespace openscreen::cast {
++namespace {
++class AudioSender final : public FakeSender {
++ public:
++  explicit AudioSender(int channels) : config_(FakeSender::config()) {
++    config_.rtp_timebase = 48000;
++    config_.channels = channels;
++  }
++  const SessionConfig& config() const override { return config_; }
++  EnqueueFrameResult EnqueueFrame(const EncodedFrame& frame) override {
++    packets.emplace_back(frame.data.begin(), frame.data.end());
++    references.push_back(frame.reference_time);
++    captures.push_back(frame.capture_end_time);
++    timestamps.push_back(frame.rtp_timestamp);
++    return FakeSender::EnqueueFrame(frame);
++  }
++  SessionConfig config_;
++  std::vector<std::vector<uint8_t>> packets;
++  std::vector<Clock::time_point> references, captures;
++  std::vector<RtpTimeTicks> timestamps;
++};
++}  // namespace
++
++TEST(StreamingOpusEncoderTest, FlushPreservesFinalSamplesAndIsIdempotent) {
++  const auto origin = Clock::time_point(std::chrono::seconds(1));
++  const auto reference = origin + std::chrono::milliseconds(250);
++  for (int channels : {1, 2}) {
++    for (int count : {0, 1, 479, 480, 481, 959, 960, 2000}) {
++      auto sender = std::make_unique<AudioSender>(channels);
++      auto* recorded = sender.get();
++      StreamingOpusEncoder encoder(channels, 100, std::move(sender));
++      encoder.Flush();
++      EXPECT_TRUE(recorded->packets.empty());
++      std::vector<float> input(count * channels);
++      for (int i = std::max(0, count - 480); i < count; ++i) {
++        for (int channel = 0; channel < channels; ++channel) {
++          input[i * channels + channel] = 0.5f * std::sin(i * 0.2f);
++        }
++      }
++      if (count) {
++        encoder.EncodeAndSend(input.data(), count, origin, origin, reference);
++      }
++      encoder.Flush();
++      const auto packets = recorded->packets.size();
++      encoder.Flush();
++      EXPECT_EQ(recorded->packets.size(), packets);
++      if (!count) {
++        EXPECT_EQ(packets, 0u);
++        continue;
++      }
++      const auto delay = reference - recorded->references.front();
++      const int lookahead = std::chrono::duration_cast<std::chrono::microseconds>(delay).count() * 48000 / 1000000;
++      EXPECT_GT(lookahead, 0);
++      EXPECT_EQ(packets, static_cast<size_t>((count + lookahead + 479) / 480));
++      int error = 0;
++      OpusDecoder* decoder = opus_decoder_create(48000, channels, &error);
++      ASSERT_EQ(error, OPUS_OK);
++      std::vector<float> decoded(packets * 480 * channels);
++      for (size_t i = 0; i < packets; ++i) {
++        EXPECT_EQ(opus_decode_float(decoder, recorded->packets[i].data(),
++                    recorded->packets[i].size(), decoded.data() + i * 480 * channels,
++                    480, 0), 480);
++        EXPECT_EQ(recorded->references[i], reference - delay + std::chrono::milliseconds(10 * i));
++        EXPECT_EQ(recorded->captures[i], origin);  // No future capture time invented.
++        if (i) EXPECT_EQ(recorded->timestamps[i] - recorded->timestamps[i - 1], RtpTimeDelta::FromTicks(480));
++      }
++      opus_decoder_destroy(decoder);
++      for (float sample : decoded) EXPECT_TRUE(std::isfinite(sample));
++      if (count == 2000) {
++        double energy = 0;
++        for (int i = lookahead + count - 240; i < lookahead + count; ++i)
++          energy += std::abs(decoded[i * channels]);
++        EXPECT_GT(energy, 5.0);  // The audible tail emerges from actual Opus decode.
++      }
++    }
++  }
++}
++}  // namespace openscreen::cast
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,196 @@
+diff --git a/platform/api/tls_connection_factory.h b/platform/api/tls_connection_factory.h
+index 0efda5b5..a1372cdc 100644
+--- a/platform/api/tls_connection_factory.h
++++ b/platform/api/tls_connection_factory.h
+@@ -66,11 +66,14 @@ class TlsConnectionFactory {
+ 
+   // Set the TlsCredentials used for listening for new connections. Currently,
+   // having different certificates on different address is not supported. This
+-  // must be called before the first call to Listen.
+-  virtual void SetListenCredentials(const TlsCredentials& credentials) = 0;
+-
+-  // Fires an OnAccepted or OnConnectionFailed event.
+-  virtual void Listen(const IPEndpoint& local_address,
++  // must be called before the first call to Listen. Returns success only when
++  // credentials have been installed; invalid credentials also notify OnError.
++  virtual Error SetListenCredentials(const TlsCredentials& credentials) = 0;
++
++  // Returns success only after bind/listen and accept registration complete.
++  // On failure no new listener is retained, and OnError is also dispatched.
++  // Future inbound connections fire OnAccepted. Call on the owner task runner.
++  virtual Error Listen(const IPEndpoint& local_address,
+                       const TlsListenOptions& options) = 0;
+ 
+  protected:
+diff --git a/platform/impl/tls_connection_factory_posix.cc b/platform/impl/tls_connection_factory_posix.cc
+index 569795c9..ecf523cd 100644
+--- a/platform/impl/tls_connection_factory_posix.cc
++++ b/platform/impl/tls_connection_factory_posix.cc
+@@ -15,6 +15,7 @@
+ #include <unistd.h>
+ 
+ #include <cstring>
++#include <limits>
+ #include <utility>
+ #include <vector>
+ 
+@@ -105,10 +106,17 @@ void TlsConnectionFactoryPosix::Connect(const IPEndpoint& remote_address,
+   Connect(std::move(connection));
+ }
+ 
+-void TlsConnectionFactoryPosix::SetListenCredentials(
++Error TlsConnectionFactoryPosix::SetListenCredentials(
+     const TlsCredentials& credentials) {
+   OSP_CHECK(task_runner_->IsRunningOnTaskRunner());
++  listen_credentials_set_ = false;
+   EnsureInitialized();
++  if (!ssl_context_ ||
++      credentials.der_x509_cert.size() > std::numeric_limits<int>::max() ||
++      credentials.der_rsa_private_key.size() > std::numeric_limits<int>::max()) {
++    DispatchError(Error::Code::kSocketListenFailure);
++    return Error::Code::kSocketListenFailure;
++  }
+ 
+   ErrorOr<bssl::UniquePtr<X509>> cert = ImportCertificate(
+       credentials.der_x509_cert.data(), credentials.der_x509_cert.size());
+@@ -118,35 +126,41 @@ void TlsConnectionFactoryPosix::SetListenCredentials(
+ 
+   if (!cert || !pkey ||
+       SSL_CTX_use_certificate(ssl_context_.get(), cert.value().get()) != 1 ||
+-      SSL_CTX_use_PrivateKey(ssl_context_.get(), pkey.value().get()) != 1) {
++      SSL_CTX_use_PrivateKey(ssl_context_.get(), pkey.value().get()) != 1 ||
++      SSL_CTX_check_private_key(ssl_context_.get()) != 1) {
+     DispatchError(Error::Code::kSocketListenFailure);
+     TRACE_SET_RESULT(Error::Code::kSocketListenFailure);
+-    return;
++    return Error::Code::kSocketListenFailure;
+   }
+ 
+   listen_credentials_set_ = true;
++  return Error::None();
+ }
+ 
+-void TlsConnectionFactoryPosix::Listen(const IPEndpoint& local_address,
++Error TlsConnectionFactoryPosix::Listen(const IPEndpoint& local_address,
+                                        const TlsListenOptions& options) {
+   OSP_CHECK(task_runner_->IsRunningOnTaskRunner());
+-  // Credentials must be set before Listen() is called.
+-  OSP_CHECK(listen_credentials_set_);
++  if (!listen_credentials_set_) {
++    DispatchError(Error::Code::kSocketListenFailure);
++    return Error::Code::kSocketListenFailure;
++  }
+ 
+   auto socket = std::make_unique<StreamSocketPosix>(local_address);
+-  socket->Bind();
+-  socket->Listen(options.backlog_size);
+-  if (socket->state() == TcpSocketState::kClosed) {
+-    DispatchError(Error::Code::kSocketListenFailure);
+-    TRACE_SET_RESULT(Error::Code::kSocketListenFailure);
+-    return;
++  Error error = socket->Bind();
++  if (error.ok()) {
++    error = socket->Listen(options.backlog_size);
++  }
++  if (!error.ok()) {
++    DispatchError(error);
++    TRACE_SET_RESULT(error);
++    return error;
+   }
+-  OSP_CHECK(socket->state() == TcpSocketState::kListening);
+ 
+   if (platform_client_) {
+     platform_client_->tls_data_router()->RegisterAcceptObserver(
+         std::move(socket), this);
+   }
++  return Error::None();
+ }
+ 
+ void TlsConnectionFactoryPosix::OnConnectionPending(StreamSocketPosix* socket) {
+diff --git a/platform/impl/tls_connection_factory_posix.h b/platform/impl/tls_connection_factory_posix.h
+index 42d7c4fb..a1a49583 100644
+--- a/platform/impl/tls_connection_factory_posix.h
++++ b/platform/impl/tls_connection_factory_posix.h
+@@ -49,8 +49,8 @@ class TlsConnectionFactoryPosix : public TlsConnectionFactory,
+   // to the same remote_address, and how to distinguish errors.
+   void Connect(const IPEndpoint& remote_address,
+                const TlsConnectOptions& options) override;
+-  void SetListenCredentials(const TlsCredentials& credentials) override;
+-  void Listen(const IPEndpoint& local_address,
++  Error SetListenCredentials(const TlsCredentials& credentials) override;
++  Error Listen(const IPEndpoint& local_address,
+               const TlsListenOptions& options) override;
+ 
+  private:
+diff --git a/platform/impl/tls_connection_factory_posix_unittest.cc b/platform/impl/tls_connection_factory_posix_unittest.cc
+index d4c3e637..718bb46c 100644
+--- a/platform/impl/tls_connection_factory_posix_unittest.cc
++++ b/platform/impl/tls_connection_factory_posix_unittest.cc
+@@ -5,6 +5,9 @@
+ #include "platform/impl/tls_connection_factory_posix.h"
+ 
+ #include <openssl/ssl.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
+ 
+ #include <memory>
+ #include <utility>
+@@ -12,7 +15,10 @@
+ 
+ #include "gmock/gmock.h"
+ #include "gtest/gtest.h"
++#include "platform/base/tls_credentials.h"
++#include "platform/base/tls_listen_options.h"
+ #include "platform/test/fake_clock.h"
++#include "util/crypto/certificate_utils.h"
+ #include "platform/test/fake_task_runner.h"
+ 
+ namespace openscreen {
+@@ -88,6 +94,46 @@ class TlsConnectionFactoryPosixTest : public ::testing::Test {
+   bssl::UniquePtr<SSL> ssl_;
+ };
+ 
++TEST_F(TlsConnectionFactoryPosixTest, InvalidCredentialsAndMissingCredentials) {
++  EXPECT_CALL(client_, OnError(&factory_, testing::_)).Times(2);
++  EXPECT_FALSE(factory_.SetListenCredentials(TlsCredentials{}).ok());
++  EXPECT_FALSE(factory_.Listen({{127, 0, 0, 1}, 0}, {8}).ok());
++  task_runner_.RunTasksUntilIdle();
++}
++
++TEST_F(TlsConnectionFactoryPosixTest, OccupiedPortReturnsErrorWithoutAbort) {
++  auto key = GenerateRsaKeyPair();
++  ASSERT_TRUE(key);
++  auto cert = CreateSelfSignedX509Certificate("listen test", std::chrono::hours(1), *key);
++  ASSERT_TRUE(cert);
++  auto der = ExportX509CertificateToDer(*cert.value());
++  ASSERT_TRUE(der);
++  uint8_t* bytes = nullptr;
++  size_t size = 0;
++  ASSERT_TRUE(RSA_private_key_to_bytes(&bytes, &size, EVP_PKEY_get0_RSA(key.get())));
++  TlsCredentials credentials;
++  credentials.der_rsa_private_key.assign(bytes, bytes + size);
++  OPENSSL_free(bytes);
++  credentials.der_x509_cert = std::move(der.value());
++  ASSERT_TRUE(factory_.SetListenCredentials(credentials).ok());
++
++  const int fd = socket(AF_INET, SOCK_STREAM, 0);
++  ASSERT_GE(fd, 0);
++  // Keep the OS-assigned port reserved throughout the test, with no sleeps.
++  struct CloseSocket { int fd; ~CloseSocket() { close(fd); } } owner{fd};
++  sockaddr_in address{};
++  address.sin_family = AF_INET;
++  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++  ASSERT_EQ(bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
++  ASSERT_EQ(listen(fd, 8), 0);
++  socklen_t length = sizeof(address);
++  ASSERT_EQ(getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length), 0);
++  EXPECT_CALL(client_, OnError(&factory_, testing::_)).Times(1);
++  EXPECT_EQ(factory_.Listen({{127, 0, 0, 1}, ntohs(address.sin_port)}, {8}).code(),
++            Error::Code::kSocketBindFailure);
++  task_runner_.RunTasksUntilIdle();
++}
++
+ TEST_F(TlsConnectionFactoryPosixTest, InsertAndLookup) {
+   IPEndpoint remote{{127, 0, 0, 1}, 1234};
+   auto session = CreateSession(100);

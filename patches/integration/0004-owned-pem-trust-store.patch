@@ -1,0 +1,156 @@
+From d4bcec90080aba7e70cff861453cef87f37e1e59 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Vojt=C4=9Bch=20Jungmann?= <vojta.jungmann@gmail.com>
+Date: Thu, 8 Oct 2026 17:29:40 +0200
+Subject: [PATCH] Accept and validate an owned explicit PEM trust bundle
+
+---
+ .../certificate/boringssl_trust_store.cc      | 38 ++++++++++++++++
+ .../cast_cert_validator_unittest.cc           | 43 +++++++++++++++++++
+ cast/common/public/trust_store.h              |  7 +++
+ 3 files changed, 88 insertions(+)
+
+diff --git a/cast/common/certificate/boringssl_trust_store.cc b/cast/common/certificate/boringssl_trust_store.cc
+index 14c84c7d..df9ffabc 100644
+--- a/cast/common/certificate/boringssl_trust_store.cc
++++ b/cast/common/certificate/boringssl_trust_store.cc
+@@ -8,6 +8,7 @@
+ #include <openssl/evp.h>
+ #include <openssl/mem.h>
+ #include <openssl/ossl_typ.h>
++#include <openssl/pem.h>
+ #include <openssl/x509.h>
+ #include <openssl/x509v3.h>
+ #include <time.h>
+@@ -15,6 +16,7 @@
+ #include <chrono>
+ #include <format>
+ #include <memory>
++#include <limits>
+ #include <string>
+ #include <string_view>
+ #include <utility>
+@@ -314,6 +316,42 @@ X509* ParseX509Der(const std::string& der) {
+ 
+ }  // namespace
+ 
++// static
++ErrorOr<std::unique_ptr<TrustStore>> TrustStore::CreateInstanceFromPem(
++    std::string_view pem) {
++  constexpr std::string_view kBegin = "-----BEGIN CERTIFICATE-----";
++  constexpr std::string_view kEnd = "-----END CERTIFICATE-----";
++  constexpr std::string_view kWhitespace = " \t\r\n\f\v";
++  std::vector<bssl::UniquePtr<X509>> certs;
++  while (true) {
++    const size_t first = pem.find_first_not_of(kWhitespace);
++    if (first == std::string_view::npos) {
++      break;
++    }
++    pem.remove_prefix(first);
++    const size_t end = pem.find(kEnd);
++    if (!pem.starts_with(kBegin) || end == std::string_view::npos ||
++        end + kEnd.size() > std::numeric_limits<int>::max()) {
++      return Error(Error::Code::kErrCertsParse, "Malformed PEM trust bundle");
++    }
++    const size_t length = end + kEnd.size();
++    bssl::UniquePtr<BIO> input(BIO_new_mem_buf(pem.data(), length));
++    bssl::UniquePtr<X509> cert(
++        input ? PEM_read_bio_X509(input.get(), nullptr, nullptr, nullptr)
++              : nullptr);
++    if (!cert) {
++      return Error(Error::Code::kErrCertsParse, "Invalid PEM certificate");
++    }
++    certs.push_back(std::move(cert));
++    pem.remove_prefix(length);
++  }
++  if (certs.empty()) {
++    return Error(Error::Code::kErrCertsMissing, "Empty PEM trust bundle");
++  }
++  return std::unique_ptr<TrustStore>(
++      std::make_unique<BoringSSLTrustStore>(std::move(certs)));
++}
++
+ // static
+ std::unique_ptr<TrustStore> TrustStore::CreateInstanceFromPemFile(
+     std::string_view file_path) {
+diff --git a/cast/common/certificate/cast_cert_validator_unittest.cc b/cast/common/certificate/cast_cert_validator_unittest.cc
+index 39983598..b5948b8b 100644
+--- a/cast/common/certificate/cast_cert_validator_unittest.cc
++++ b/cast/common/certificate/cast_cert_validator_unittest.cc
+@@ -7,6 +7,9 @@
+ #include <stdio.h>
+ #include <string.h>
+ 
++#include <fstream>
++#include <iterator>
++
+ #include "cast/common/certificate/date_time.h"
+ #include "cast/common/certificate/testing/test_helpers.h"
+ #include "cast/common/public/trust_store.h"
+@@ -150,6 +153,46 @@ const std::string& GetSpecificTestDataPath() {
+   return *data_path;
+ }
+ 
++TEST(TrustStorePemTest, RejectsEmptyMalformedAndPartialBundles) {
++  for (const std::string_view pem : {
++           "", " \n\t", "not a certificate",
++           "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----",
++           "-----BEGIN CERTIFICATE-----\nAAAA"}) {
++    EXPECT_TRUE(TrustStore::CreateInstanceFromPem(pem).is_error());
++  }
++  std::ifstream file(GetSpecificTestDataPath() + "certificates/cast_root_ca.pem");
++  ASSERT_TRUE(file.good());
++  std::string valid{std::istreambuf_iterator<char>(file), {}};
++  // The fixture includes an openssl -text preamble, outside the PEM bundle.
++  const size_t begin = valid.find("-----BEGIN CERTIFICATE-----");
++  ASSERT_NE(begin, std::string::npos);
++  valid.erase(0, begin);
++  ASSERT_FALSE(TrustStore::CreateInstanceFromPem(valid).is_error());
++  EXPECT_TRUE(TrustStore::CreateInstanceFromPem(valid + "garbage").is_error());
++  EXPECT_TRUE(TrustStore::CreateInstanceFromPem(
++      valid + "-----BEGIN CERTIFICATE-----\nAAAA").is_error());
++}
++
++TEST(TrustStorePemTest, OwnsValidatedRootsAndPreservesChainAuthentication) {
++  std::ifstream file(GetSpecificTestDataPath() + "certificates/cast_root_ca.pem");
++  ASSERT_TRUE(file.good());
++  std::string pem{std::istreambuf_iterator<char>(file), {}};
++  const size_t begin = pem.find("-----BEGIN CERTIFICATE-----");
++  ASSERT_NE(begin, std::string::npos);
++  pem.erase(0, begin);
++  auto parsed = TrustStore::CreateInstanceFromPem(pem);
++  ASSERT_FALSE(parsed.is_error());
++  pem.assign(pem.size(), 'x');
++  auto chain = ReadCertificatesFromPemFile(
++      GetSpecificTestDataPath() + "certificates/chromecast_gen2.pem");
++  ASSERT_FALSE(chain.empty());
++  auto result = parsed.value()->FindCertificatePath(chain, AprilFirst2016());
++  ASSERT_FALSE(result.is_error());
++  chain[0] = "invalid DER";
++  EXPECT_TRUE(parsed.value()->FindCertificatePath(chain, AprilFirst2016())
++                  .is_error());
++}
++
+ // Tests verifying a valid certificate chain of length 2:
+ //
+ //   0: 2ZZBG9 FA8FCA3EF91A
+diff --git a/cast/common/public/trust_store.h b/cast/common/public/trust_store.h
+index 5f1f6674..b759dab5 100644
+--- a/cast/common/public/trust_store.h
++++ b/cast/common/public/trust_store.h
+@@ -29,6 +29,13 @@ class TrustStore {
+   static std::unique_ptr<TrustStore> CreateInstanceFromPemFile(
+       std::string_view file_path);
+ 
++  // Parses an explicit, nonempty PEM trust bundle. The returned store owns its
++  // certificates; callers may release the input immediately. Malformed entries,
++  // trailing non-whitespace data, and empty bundles fail without a fallback to
++  // the built-in trust store. Certificate validity is checked during validation.
++  static ErrorOr<std::unique_ptr<TrustStore>> CreateInstanceFromPem(
++      std::string_view pem);
++
+   static std::unique_ptr<TrustStore> CreateInstanceForTest(
+       ByteView trust_anchor_der);
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "openscreen": {
+    "repository": "https://chromium.googlesource.com/openscreen",
+    "revision": "bbe3f57202748d19b2bf400417c9b2e087b12e2b",
+    "previous_revision": "1f070e8b01b063fd1dcc6827a9ea1b62301c3d1a",
+    "resolved_ref": "refs/heads/main",
+    "fetched_at": "2026-10-08T14:48:37.066198+00:00",
+    "toolchain": "DEPS"
+  },
+  "libraries": {
+    "opus": {
+      "repository": "https://github.com/xiph/opus.git",
+      "revision": "22244de5a79bd1d6d623c32e72bf1954b56235be",
+      "resolved_ref": "refs/tags/v1.6.1"
+    },
+    "libvpx": {
+      "repository": "https://chromium.googlesource.com/webm/libvpx",
+      "revision": "d168454ecd099805c675d4a98c66f4891373302a",
+      "resolved_ref": "refs/tags/v1.15.2"
+    },
+    "libaom": {
+      "repository": "https://aomedia.googlesource.com/aom",
+      "revision": "d772e334cc724105040382a977ebb10dfd393293",
+      "resolved_ref": "refs/tags/v3.13.1"
+    },
+    "ffmpeg": {
+      "repository": "https://git.ffmpeg.org/ffmpeg.git",
+      "revision": "894da5ca7d742e4429ffb2af534fcda0103ef593",
+      "resolved_ref": "refs/tags/n8.0.1"
+    }
+  },
+  "build": {
+    "macos_deployment_target": "12.7.6",
+    "architectures": [
+      "arm64",
+      "x86_64"
+    ],
+    "default_architecture": "native",
+    "universal": "explicit",
+    "validation": "pending native build and runtime gates",
+    "av1_sender_default": false,
+    "av1_sender": "opt-in",
+    "ffmpeg": {
+      "decoders": true,
+      "demuxers": true,
+      "parsers": true,
+      "encoders": false,
+      "videotoolbox": true,
+      "audiotoolbox": true,
+      "conversion": [
+        "swscale",
+        "swresample"
+      ]
+    },
+    "libaom_decoder": true
+  },
+  "integration": {
+    "expected_upstream_revision": "bbe3f57202748d19b2bf400417c9b2e087b12e2b",
+    "patches": [
+      {
+        "path": "patches/integration/0001-reusable-codec-targets.patch",
+        "sha256": "1b244b8fc82fd3e0986d61149e933b7cbbecc0d2c04b7545760ccc59af218c30"
+      },
+      {
+        "path": "patches/integration/0002-checked-tls-listen.patch",
+        "sha256": "ecf6f8dd5d11293bf93c5a596b3daa0997c381d7287e4b22b5021ffafcba4d13"
+      },
+      {
+        "path": "patches/integration/0003-bound-pending-encoder-frames.patch",
+        "sha256": "6eb3678b5c03171ce5f97c7e63aaf4319c62223253128055ad5bc75cca6cf32d"
+      },
+      {
+        "path": "patches/integration/0004-owned-pem-trust-store.patch",
+        "sha256": "51018a59167f0e498e0176f9ffa56efe032ebcaec23a12405d6c5f53b37c0b1e"
+      },
+      {
+        "path": "patches/integration/0005-flush-opus-end-of-input.patch",
+        "sha256": "a0478c36618cf5e9b6fdea862609ed6a21f26a1aae2befbad0ef880eda35babf"
+      },
+      {
+        "path": "patches/integration/0006-owned-receiver-credentials.patch",
+        "sha256": "0753c8ca2ccee185823b9e965f95cb6bea7f13fc14cc5a5c233095a0567cb5d8"
+      }
+    ]
+  },
+  "tools": {
+    "depot_tools": {
+      "repository": "https://chromium.googlesource.com/chromium/tools/depot_tools.git",
+      "revision": "c3d79a03349c210945359154daf703854b8f76c0"
+    }
+  }
+}

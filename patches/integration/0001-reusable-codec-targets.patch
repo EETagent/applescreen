@@ -1,0 +1,222 @@
+From b6b3a3ba3f92b1dc1eb33f90a0688a97c59531d8 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Vojt=C4=9Bch=20Jungmann?= <vojta.jungmann@gmail.com>
+Date: Thu, 8 Oct 2026 17:48:47 +0200
+Subject: [PATCH] Extract narrowly visible reusable codec workers for native
+ embedders
+
+---
+ cast/common/BUILD.gn              |  1 +
+ cast/receiver/BUILD.gn            |  2 +-
+ cast/standalone_common/BUILD.gn   | 18 ++++++--
+ cast/standalone_receiver/BUILD.gn | 20 +++++++--
+ cast/standalone_sender/BUILD.gn   | 70 ++++++++++++++++---------------
+ platform/BUILD.gn                 |  1 +
+ 6 files changed, 72 insertions(+), 40 deletions(-)
+
+diff --git a/cast/common/BUILD.gn b/cast/common/BUILD.gn
+index 704e1f08..7bbc5600 100644
+--- a/cast/common/BUILD.gn
++++ b/cast/common/BUILD.gn
+@@ -52,6 +52,7 @@ openscreen_source_set("certificate_boringssl") {
+   # //components/media_router/common/providers/cast/channel. We don't
+   # use [ "*" ] here to prevent accidental usage of boringssl in Chromium.
+   visibility += [
++    "//applescreen:cast_core",
+     "../..:openscreen_unittests",
+     "../standalone_receiver:cast_receiver",
+     "../standalone_sender:*",
+diff --git a/cast/receiver/BUILD.gn b/cast/receiver/BUILD.gn
+index 0b891c3c..d62c026a 100644
+--- a/cast/receiver/BUILD.gn
++++ b/cast/receiver/BUILD.gn
+@@ -37,7 +37,7 @@ openscreen_source_set("channel") {
+ }
+ 
+ openscreen_source_set("agent") {
+-  visibility += [ "../standalone_receiver:*" ]
++  visibility += [ "../standalone_receiver:*", "//applescreen:cast_core" ]
+   public = [ "application_agent.h" ]
+   sources = [ "application_agent.cc" ]
+ 
+diff --git a/cast/standalone_common/BUILD.gn b/cast/standalone_common/BUILD.gn
+index 3424ab2f..5a523b7d 100644
+--- a/cast/standalone_common/BUILD.gn
++++ b/cast/standalone_common/BUILD.gn
+@@ -13,9 +13,14 @@ config("ffmpeg_config") {
+   include_dirs = ffmpeg_include_dirs
+ }
+ 
+-openscreen_source_set("ffmpeg_glue") {
+-  testonly = true
+-  visibility = [ "../*" ]
++openscreen_source_set("ffmpeg") {
++  visibility = []
++  visibility = [
++    ":ffmpeg_glue",
++    "../standalone_receiver:decoder",
++    "../standalone_sender:streaming_encoders",
++    "//applescreen:cast_core",
++  ]
+ 
+   public = [ "ffmpeg_glue.h" ]
+   sources = [ "ffmpeg_glue.cc" ]
+@@ -25,3 +30,10 @@ openscreen_source_set("ffmpeg_glue") {
+   deps = [ "../../util" ]
+   public_configs = [ ":ffmpeg_config" ]
+ }
++
++# Preserve the sample target and its test-only contract.
++group("ffmpeg_glue") {
++  testonly = true
++  visibility = [ "../*" ]
++  public_deps = [ ":ffmpeg" ]
++}
+diff --git a/cast/standalone_receiver/BUILD.gn b/cast/standalone_receiver/BUILD.gn
+index 0b224889..fdb095f8 100644
+--- a/cast/standalone_receiver/BUILD.gn
++++ b/cast/standalone_receiver/BUILD.gn
+@@ -14,6 +14,22 @@ visibility = [ "./*" ]
+ #
+ # See [external_libraries.md](../../build/config/external_libraries.md) for more information.
+ 
++# Codec utility shared by the sample and the native embedder; no SDL dependency.
++if (have_ffmpeg) {
++  openscreen_source_set("decoder") {
++  visibility = []
++    visibility = [ ":cast_receiver_lib", "//applescreen:cast_core" ]
++    public = [ "decoder.h" ]
++    sources = [ "decoder.cc" ]
++    public_deps = [
++      "../standalone_common:ffmpeg",
++      "../streaming:common",
++      "../../platform",
++      "../../util",
++    ]
++  }
++}
++
+ openscreen_source_set("cast_receiver_lib") {
+   testonly = true
+   public = [ "cast_service.h" ]
+@@ -41,8 +57,6 @@ openscreen_source_set("cast_receiver_lib") {
+   if (have_ffmpeg && have_libsdl2) {
+     defines = [ "CAST_STANDALONE_RECEIVER_HAVE_EXTERNAL_LIBS" ]
+     sources += [
+-      "decoder.cc",
+-      "decoder.h",
+       "sdl_audio_player.cc",
+       "sdl_audio_player.h",
+       "sdl_glue.cc",
+@@ -52,7 +66,7 @@ openscreen_source_set("cast_receiver_lib") {
+       "sdl_video_player.cc",
+       "sdl_video_player.h",
+     ]
+-    deps += [ "../standalone_common:ffmpeg_glue" ]
++    deps += [ ":decoder" ]
+     include_dirs = ffmpeg_include_dirs + libsdl2_include_dirs
+     lib_dirs = external_lib_dirs + ffmpeg_lib_dirs + libsdl2_lib_dirs
+     libs = ffmpeg_libs + libsdl2_libs
+diff --git a/cast/standalone_sender/BUILD.gn b/cast/standalone_sender/BUILD.gn
+index 70cf7bd2..6b96bfaf 100644
+--- a/cast/standalone_sender/BUILD.gn
++++ b/cast/standalone_sender/BUILD.gn
+@@ -34,6 +34,42 @@ if (!build_with_chromium) {
+     }
+   }
+ 
++  # Reusable codec workers, separated from file looping, discovery and remoting.
++  if (have_external_libs) {
++    openscreen_source_set("streaming_encoders") {
++    visibility = []
++      visibility = [ ":cast_sender_core", "//applescreen:cast_core" ]
++      sources = [
++        "streaming_encoder_util.cc",
++        "streaming_encoder_util.h",
++        "streaming_opus_encoder.cc",
++        "streaming_opus_encoder.h",
++        "streaming_video_encoder.cc",
++        "streaming_video_encoder.h",
++        "streaming_vpx_encoder.cc",
++        "streaming_vpx_encoder.h",
++        "streaming_ffmpeg_encoder.cc",
++        "streaming_ffmpeg_encoder.h",
++      ]
++      public_deps = [
++        "../../platform",
++        "../../util",
++        "../streaming:common",
++        "../streaming:sender",
++        "../standalone_common:ffmpeg",
++      ]
++      public_configs = [ ":standalone_external_libs" ]
++      lib_dirs = external_lib_dirs + ffmpeg_lib_dirs + libopus_lib_dirs +
++                 libvpx_lib_dirs
++      libs = ffmpeg_libs + libopus_libs + libvpx_libs
++      if (have_libaom) {
++        sources += [ "streaming_av1_encoder.cc", "streaming_av1_encoder.h" ]
++        lib_dirs += libaom_lib_dirs
++        libs += libaom_libs
++      }
++    }
++  }
++
+   openscreen_source_set("cast_sender_core") {
+     testonly = true
+     visibility += [ "../*" ]
+@@ -73,40 +109,8 @@ if (!build_with_chromium) {
+         "looping_file_sender.h",
+         "simulated_capturer.cc",
+         "simulated_capturer.h",
+-        "streaming_encoder_util.cc",
+-        "streaming_encoder_util.h",
+-        "streaming_opus_encoder.cc",
+-        "streaming_opus_encoder.h",
+-        "streaming_video_encoder.cc",
+-        "streaming_video_encoder.h",
+-        "streaming_vpx_encoder.cc",
+-        "streaming_vpx_encoder.h",
+       ]
+-
+-      if (have_ffmpeg) {
+-        sources += [
+-          "streaming_ffmpeg_encoder.cc",
+-          "streaming_ffmpeg_encoder.h",
+-        ]
+-        public_deps += [ "../standalone_common:ffmpeg_glue" ]
+-      }
+-
+-      include_dirs +=
+-          ffmpeg_include_dirs + libopus_include_dirs + libvpx_include_dirs
+-      lib_dirs += external_lib_dirs + ffmpeg_lib_dirs + libopus_lib_dirs +
+-                  libvpx_lib_dirs
+-      libs += ffmpeg_libs + libopus_libs + libvpx_libs
+-
+-      if (have_libaom) {
+-        sources += [
+-          "streaming_av1_encoder.cc",
+-          "streaming_av1_encoder.h",
+-        ]
+-
+-        include_dirs += libaom_include_dirs
+-        lib_dirs += libaom_lib_dirs
+-        libs += libaom_libs
+-      }
++      public_deps += [ ":streaming_encoders" ]
+     } else {
+       sources += [
+         "synthetic_file_sender.cc",
+diff --git a/platform/BUILD.gn b/platform/BUILD.gn
+index 294cddbd..939e0539 100644
+--- a/platform/BUILD.gn
++++ b/platform/BUILD.gn
+@@ -103,6 +103,7 @@ if (!is_ios) {
+     }
+     defines = []
+     visibility += [
++      "//applescreen:cast_core",
+       "../cast/common:discovery_e2e_test",
+       "../cast/standalone_receiver:cast_receiver",
+       "../cast/standalone_sender:*",
+-- 
+2.54.0 (Apple Git-157)
+

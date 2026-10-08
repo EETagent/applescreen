@@ -1,0 +1,243 @@
+diff --git a/cast/standalone_sender/BUILD.gn b/cast/standalone_sender/BUILD.gn
+index 73c418ec..dbf13055 100644
+--- a/cast/standalone_sender/BUILD.gn
++++ b/cast/standalone_sender/BUILD.gn
+@@ -149,6 +149,7 @@ if (!build_with_chromium) {
+     if (have_external_libs && have_ffmpeg) {
+       sources += [
+         "looping_file_sender_unittest.cc",
++        "streaming_queue_unittest.cc",
+         "streaming_ffmpeg_encoder_unittest.cc",
+         "testing/fake_sender.h",
+       ]
+diff --git a/cast/standalone_sender/streaming_av1_encoder.cc b/cast/standalone_sender/streaming_av1_encoder.cc
+index a2eaeabc..74385da4 100644
+--- a/cast/standalone_sender/streaming_av1_encoder.cc
++++ b/cast/standalone_sender/streaming_av1_encoder.cc
+@@ -114,6 +114,9 @@ void StreamingAv1Encoder::EncodeAndSend(
+     Clock::time_point reference_time,
+     std::function<void(Stats)> stats_callback) {
+   OSP_DCHECK(main_task_runner_.IsRunningOnTaskRunner());
++  if (pending_frames_ >= params_.max_pending_frames) {
++    return;  // Reject before allocating/copying a raw image.
++  }
+   WorkUnit work_unit;
+   work_unit.capture_begin_time = frame.capture_begin_time;
+   work_unit.capture_end_time = frame.capture_end_time;
+@@ -160,6 +163,8 @@ void StreamingAv1Encoder::EncodeAndSend(
+ 
+   work_unit.image = CloneAsAv1Image(frame);
+ 
++  ++pending_frames_;
++
+   TRACE_FLOW_STEP_WITH_TIME(TraceCategory::kStandaloneSender, "Frame.Capture",
+                             work_unit.rtp_timestamp.value(),
+                             work_unit.capture_begin_time);
+@@ -377,6 +382,8 @@ void StreamingAv1Encoder::ComputeFrameEncodeStats(
+ }
+ 
+ void StreamingAv1Encoder::SendEncodedFrame(WorkUnitWithResults results) {
++  OSP_DCHECK_GT(pending_frames_, 0u);
++  --pending_frames_;
+   OSP_CHECK(main_task_runner_.IsRunningOnTaskRunner());
+ 
+   EncodedFrame frame;
+diff --git a/cast/standalone_sender/streaming_av1_encoder.h b/cast/standalone_sender/streaming_av1_encoder.h
+index 008bd002..7e688e26 100644
+--- a/cast/standalone_sender/streaming_av1_encoder.h
++++ b/cast/standalone_sender/streaming_av1_encoder.h
+@@ -149,9 +149,8 @@ class StreamingAv1Encoder : public StreamingVideoEncoder {
+   bool needs_key_frame_ OSP_GUARDED_BY(mutex_) = true;
+   int target_bitrate_ OSP_GUARDED_BY(mutex_) = 2 << 20;  // Default: 2 Mbps.
+ 
+-  // The queue of frame encodes. The size of this queue is implicitly bounded by
+-  // EncodeAndSend(), where it checks for the total in-flight media duration and
+-  // maybe drops a frame.
++  // Raw work is bounded by Parameters::max_pending_frames, including work
++  // whose result is waiting for the owner task runner.
+   std::queue<WorkUnit> encode_queue_ OSP_GUARDED_BY(mutex_);
+ 
+   // Current AV1 encoder configuration. Most of the fields are unchanging, and
+diff --git a/cast/standalone_sender/streaming_ffmpeg_encoder.cc b/cast/standalone_sender/streaming_ffmpeg_encoder.cc
+index 441dbc05..875bc205 100644
+--- a/cast/standalone_sender/streaming_ffmpeg_encoder.cc
++++ b/cast/standalone_sender/streaming_ffmpeg_encoder.cc
+@@ -194,6 +194,9 @@ void StreamingFfmpegEncoder::EncodeAndSend(
+     Clock::time_point reference_time,
+     std::function<void(Stats)> stats_callback) {
+   OSP_DCHECK(main_task_runner_.IsRunningOnTaskRunner());
++  if (pending_frames_ >= params_.max_pending_frames) {
++    return;  // Reject before allocating/copying a raw image.
++  }
+   WorkUnit work_unit;
+   work_unit.capture_begin_time = frame.capture_begin_time;
+   work_unit.capture_end_time = frame.capture_end_time;
+@@ -241,6 +244,8 @@ void StreamingFfmpegEncoder::EncodeAndSend(
+     return;
+   }
+ 
++  ++pending_frames_;
++
+   TRACE_FLOW_STEP_WITH_TIME(TraceCategory::kStandaloneSender, "Frame.Capture",
+                             work_unit.rtp_timestamp.value(),
+                             work_unit.capture_begin_time);
+@@ -477,6 +482,8 @@ void StreamingFfmpegEncoder::ComputeFrameEncodeStats(
+ }
+ 
+ void StreamingFfmpegEncoder::SendEncodedFrame(WorkUnitWithResults results) {
++  OSP_DCHECK_GT(pending_frames_, 0u);
++  --pending_frames_;
+   OSP_CHECK(main_task_runner_.IsRunningOnTaskRunner());
+ 
+   if (results.payload.empty()) {
+diff --git a/cast/standalone_sender/streaming_ffmpeg_encoder.h b/cast/standalone_sender/streaming_ffmpeg_encoder.h
+index 2fb85752..57d42b74 100644
+--- a/cast/standalone_sender/streaming_ffmpeg_encoder.h
++++ b/cast/standalone_sender/streaming_ffmpeg_encoder.h
+@@ -149,9 +149,8 @@ class StreamingFfmpegEncoder : public StreamingVideoEncoder {
+   bool needs_key_frame_ OSP_GUARDED_BY(mutex_) = true;
+   int target_bitrate_ OSP_GUARDED_BY(mutex_) = 5000000;  // Default: 5 Mbps.
+ 
+-  // The queue of frame encodes. The size of this queue is implicitly bounded by
+-  // EncodeAndSend(), where it checks for the total in-flight media duration and
+-  // maybe drops a frame.
++  // Raw work is bounded by Parameters::max_pending_frames, including work
++  // whose result is waiting for the owner task runner.
+   std::queue<WorkUnit> encode_queue_ OSP_GUARDED_BY(mutex_);
+ 
+   // Active FFmpeg encoder session.
+diff --git a/cast/standalone_sender/streaming_queue_unittest.cc b/cast/standalone_sender/streaming_queue_unittest.cc
+new file mode 100644
+index 00000000..86d9cf58
+--- /dev/null
++++ b/cast/standalone_sender/streaming_queue_unittest.cc
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++#include "cast/standalone_sender/streaming_vpx_encoder.h"
++
++#include <vector>
++
++#include "cast/standalone_sender/testing/fake_sender.h"
++#include "gtest/gtest.h"
++#include "platform/test/fake_clock.h"
++#include "platform/test/fake_task_runner.h"
++
++namespace openscreen::cast {
++TEST(StreamingQueueTest, BoundsRawAndUndeliveredFramesBeforeFirstPacket) {
++  FakeClock clock(Clock::now());
++  FakeTaskRunner runner(clock);
++  for (auto codec : {VideoCodec::kVp8, VideoCodec::kVp9}) {
++    StreamingVideoEncoder::Parameters params;
++    params.codec = codec;
++    params.max_pending_frames = 2;
++    {
++      StreamingVpxEncoder encoder(params, runner, std::make_unique<FakeSender>());
++      // The source is deliberately reused/freed before the encoder is joined.
++      // No owner tasks run, even if encoding finishes quickly on this machine.
++      {
++        std::vector<uint8_t> y(16 * 16, 128), u(8 * 8, 64), v(8 * 8, 192);
++        StreamingVideoEncoder::VideoFrame frame;
++        frame.width = frame.height = 16;
++        frame.yuv_planes[0] = y.data();
++        frame.yuv_planes[1] = u.data();
++        frame.yuv_planes[2] = v.data();
++        frame.yuv_strides[0] = 16;
++        frame.yuv_strides[1] = frame.yuv_strides[2] = 8;
++        frame.duration = std::chrono::milliseconds(16);
++        for (int i = 0; i < 100; ++i) {
++          frame.capture_begin_time = frame.capture_end_time = clock.now();
++          encoder.EncodeAndSend(frame, clock.now() + i * frame.duration, {});
++          std::fill(y.begin(), y.end(), static_cast<uint8_t>(i));
++        }
++      }
++      EXPECT_EQ(encoder.pending_frames(), 2u);
++    }  // Join before touching FakeTaskRunner's result queue.
++    runner.RunTasksUntilIdle();
++  }
++}
++}  // namespace openscreen::cast
+diff --git a/cast/standalone_sender/streaming_video_encoder.h b/cast/standalone_sender/streaming_video_encoder.h
+index e9566263..b3292f28 100644
+--- a/cast/standalone_sender/streaming_video_encoder.h
++++ b/cast/standalone_sender/streaming_video_encoder.h
+@@ -79,6 +79,10 @@ class StreamingVideoEncoder {
+     // Determines which codec (VP8, VP9, or AV1) is to be used for encoding.
+     // Defaults to VP8.
+     VideoCodec codec = VideoCodec::kVp8;
++
++    // Includes queued input, active encode, and results awaiting the owner runner.
++    // Congestion duration alone cannot bound work before the first packet is sent.
++    size_t max_pending_frames = 3;
+   };
+ 
+   // Represents an input VideoFrame, passed to EncodeAndSend().
+@@ -179,6 +183,9 @@ class StreamingVideoEncoder {
+                              Clock::time_point reference_time,
+                              std::function<void(Stats)> stats_callback) = 0;
+ 
++  // Owner-sequence only. Allows admission before an embedder converts a frame.
++  size_t pending_frames() const { return pending_frames_; }
++
+   static constexpr int kMinQuantizer = 0;
+   static constexpr int kMaxQuantizer = 63;
+ 
+@@ -195,6 +202,9 @@ class StreamingVideoEncoder {
+   // encode, based on the given performance `stats`.
+   void UpdateSpeedSettingForNextFrame(const Stats& stats);
+ 
++  // Modified only on the owner sequence, released on result delivery rather
++  // than on the encode worker, so a stalled owner cannot accumulate results.
++  size_t pending_frames_ = 0;
+   const Parameters params_;
+   TaskRunner& main_task_runner_;
+   std::unique_ptr<Sender> sender_;
+diff --git a/cast/standalone_sender/streaming_vpx_encoder.cc b/cast/standalone_sender/streaming_vpx_encoder.cc
+index 4560b113..2b2c0438 100644
+--- a/cast/standalone_sender/streaming_vpx_encoder.cc
++++ b/cast/standalone_sender/streaming_vpx_encoder.cc
+@@ -125,6 +125,9 @@ void StreamingVpxEncoder::EncodeAndSend(
+     Clock::time_point reference_time,
+     std::function<void(Stats)> stats_callback) {
+   OSP_DCHECK(main_task_runner_.IsRunningOnTaskRunner());
++  if (pending_frames_ >= params_.max_pending_frames) {
++    return;  // Reject before allocating/copying a raw image.
++  }
+   WorkUnit work_unit;
+   work_unit.capture_begin_time = frame.capture_begin_time;
+   work_unit.capture_end_time = frame.capture_end_time;
+@@ -171,6 +174,8 @@ void StreamingVpxEncoder::EncodeAndSend(
+ 
+   work_unit.image = CloneAsVpxImage(frame);
+ 
++  ++pending_frames_;
++
+   TRACE_FLOW_STEP_WITH_TIME(TraceCategory::kStandaloneSender, "Frame.Capture",
+                             work_unit.rtp_timestamp.value(),
+                             work_unit.capture_begin_time);
+@@ -399,6 +404,8 @@ void StreamingVpxEncoder::ComputeFrameEncodeStats(
+ }
+ 
+ void StreamingVpxEncoder::SendEncodedFrame(WorkUnitWithResults results) {
++  OSP_DCHECK_GT(pending_frames_, 0u);
++  --pending_frames_;
+   OSP_CHECK(main_task_runner_.IsRunningOnTaskRunner());
+ 
+   EncodedFrame frame;
+diff --git a/cast/standalone_sender/streaming_vpx_encoder.h b/cast/standalone_sender/streaming_vpx_encoder.h
+index 3d694855..78623bd3 100644
+--- a/cast/standalone_sender/streaming_vpx_encoder.h
++++ b/cast/standalone_sender/streaming_vpx_encoder.h
+@@ -149,9 +149,8 @@ class StreamingVpxEncoder : public StreamingVideoEncoder {
+   bool needs_key_frame_ OSP_GUARDED_BY(mutex_) = true;
+   int target_bitrate_ OSP_GUARDED_BY(mutex_) = 2 << 20;  // Default: 2 Mbps.
+ 
+-  // The queue of frame encodes. The size of this queue is implicitly bounded by
+-  // EncodeAndSend(), where it checks for the total in-flight media duration and
+-  // maybe drops a frame.
++  // Raw work is bounded by Parameters::max_pending_frames, including work
++  // whose result is waiting for the owner task runner.
+   std::queue<WorkUnit> encode_queue_ OSP_GUARDED_BY(mutex_);
+ 
+   // Current VP8 encoder configuration. Most of the fields are unchanging, and
