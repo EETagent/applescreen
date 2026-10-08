@@ -1,0 +1,31 @@
+diff --git a/build_overrides/build.gni b/build_overrides/build.gni
+index 51f2cd2b..13d5259d 100644
+--- a/build_overrides/build.gni
++++ b/build_overrides/build.gni
+@@ -5,6 +5,19 @@
+ # Set to false to build OpenScreen targets as a standalone library.
+ build_with_chromium = false
+ 
++# Standalone embedders do not ship Chromium's tool-specific UBSan exclusions.
++# Keep every check enabled when those optional lists are absent.
++if (!defined(ubsan_ignorelist_path) &&
++    !path_exists("//tools/ubsan/ignorelist.txt")) {
++  ubsan_ignorelist_path =
++      rebase_path("//build_overrides/empty_sanitizer_ignorelist.txt", root_build_dir)
++}
++if (!defined(ubsan_vptr_ignorelist_path) &&
++    !path_exists("//tools/ubsan/vptr_ignorelist.txt")) {
++  ubsan_vptr_ignorelist_path =
++      rebase_path("//build_overrides/empty_sanitizer_ignorelist.txt", root_build_dir)
++}
++
+ # Enables assertions on safety checks in libc++.
+ #
+ # This should be set to true whenever building with Chrome's custom libc++ in
+diff --git a/build_overrides/empty_sanitizer_ignorelist.txt b/build_overrides/empty_sanitizer_ignorelist.txt
+new file mode 100644
+index 00000000..067ca937
+--- /dev/null
++++ b/build_overrides/empty_sanitizer_ignorelist.txt
+@@ -0,0 +1 @@
++# No exclusions: standalone Open Screen enables every requested sanitizer check.

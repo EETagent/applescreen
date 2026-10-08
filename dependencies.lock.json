@@ -38,7 +38,7 @@
     ],
     "default_architecture": "native",
     "universal": "explicit",
-    "validation": "pending native build and runtime gates",
+    "validation": "See docs/migration-report.md for executed gates and remaining hardware/permission limits",
     "av1_sender_default": false,
     "av1_sender": "opt-in",
     "ffmpeg": {
@@ -81,6 +81,14 @@
       {
         "path": "patches/integration/0006-owned-receiver-credentials.patch",
         "sha256": "0753c8ca2ccee185823b9e965f95cb6bea7f13fc14cc5a5c233095a0567cb5d8"
+      },
+      {
+        "path": "patches/integration/0007-decoder-frame-identity.patch",
+        "sha256": "965df5837a0b76fa154d3ee3252483a90fe8cf1d87663df46e5f74de00cee188"
+      },
+      {
+        "path": "patches/integration/0008-standalone-ubsan-defaults.patch",
+        "sha256": "2fab642103b6a95e3834c74615e7afc6a7711a6a26718c9d55cbd1405ea466bc"
       }
     ]
   },

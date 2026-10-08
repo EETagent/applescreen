@@ -1,0 +1,332 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index 5659a647..7435c8f1 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -127,6 +127,9 @@ openscreen_source_set("openscreen_unittests_all") {
+       public_deps += [ "osp:unittests" ]
+     }
+   }
++  if (have_ffmpeg) {
++    public_deps += [ "cast/standalone_receiver:unittests" ]
++  }
+   if (build_python_bindings) {
+     public_deps += [ "cast/standalone_sender/bindings/python:unittests" ]
+   }
+diff --git a/cast/standalone_receiver/BUILD.gn b/cast/standalone_receiver/BUILD.gn
+index fdb095f8..f913b18a 100644
+--- a/cast/standalone_receiver/BUILD.gn
++++ b/cast/standalone_receiver/BUILD.gn
+@@ -18,7 +18,7 @@ visibility = [ "./*" ]
+ if (have_ffmpeg) {
+   openscreen_source_set("decoder") {
+   visibility = []
+-    visibility = [ ":cast_receiver_lib", "//applescreen:cast_core" ]
++    visibility = [ ":cast_receiver_lib", ":unittests", "//applescreen:cast_core" ]
+     public = [ "decoder.h" ]
+     sources = [ "decoder.cc" ]
+     public_deps = [
+@@ -30,6 +30,16 @@ if (have_ffmpeg) {
+   }
+ }
+ 
++if (have_ffmpeg) {
++  openscreen_source_set("unittests") {
++    testonly = true
++    visibility = []
++    visibility = [ "../..:openscreen_unittests_all" ]
++    sources = [ "decoder_unittest.cc" ]
++    deps = [ ":decoder", "../../third_party/googletest:gtest" ]
++  }
++}
++
+ openscreen_source_set("cast_receiver_lib") {
+   testonly = true
+   public = [ "cast_service.h" ]
+diff --git a/cast/standalone_receiver/decoder.cc b/cast/standalone_receiver/decoder.cc
+index 275456b1..9c76df57 100644
+--- a/cast/standalone_receiver/decoder.cc
++++ b/cast/standalone_receiver/decoder.cc
+@@ -7,6 +7,7 @@
+ #include <libavcodec/version.h>
+ 
+ #include <algorithm>
++#include <cstring>
+ #include <sstream>
+ #include <thread>
+ 
+@@ -65,6 +66,20 @@ void Decoder::Decode(FrameId frame_id, const Decoder::Buffer& buffer) {
+     return;
+   }
+ 
++  if (frame_id.is_null() ||
++      std::find(frames_decoding_.begin(), frames_decoding_.end(), frame_id) !=
++          frames_decoding_.end()) {
++    OnError("invalid or duplicate decoder FrameId", AVERROR_INVALIDDATA, frame_id);
++    return;
++  }
++  // A malformed stream that produces no output cannot retain identifiers and
++  // codec-owned packets forever. Live clients normally enforce a smaller budget.
++  if (frames_decoding_.size() >= 64) {
++    FlushPendingFrames("decoder pending-frame budget", AVERROR_INVALIDDATA);
++    OnError("decoder pending-frame budget", AVERROR_INVALIDDATA, frame_id);
++    return;
++  }
++  av_packet_unref(packet_.get());
+   // Parse the buffer for the required metadata and the packet to send to the
+   // decoder.
+   ByteView input = buffer.AsByteView();
+@@ -85,13 +100,23 @@ void Decoder::Decode(FrameId frame_id, const Decoder::Buffer& buffer) {
+     return;
+   }
+ 
++  // Preserve input identity through delayed/reordered decoder output. This is
++  // an identity tag, not a media timestamp; clients retain the Cast timing.
++#if LIBAVCODEC_VERSION_MAJOR >= 60
++  packet_->opaque_ref = av_buffer_alloc(sizeof(frame_id));
++  if (!packet_->opaque_ref) {
++    OnError("allocate decoder identity", AVERROR(ENOMEM), frame_id);
++    return;
++  }
++  std::memcpy(packet_->opaque_ref->data, &frame_id, sizeof(frame_id));
++#else
++  context_->reordered_opaque = frame_id.value();
++#endif
+   // Send the packet to the decoder.
+   const int send_packet_result =
+       avcodec_send_packet(context_.get(), packet_.get());
+   if (send_packet_result < 0) {
+-    // The result should not be EAGAIN because this code always pulls out all
+-    // the decoded frames after feeding-in each AVPacket.
+-    OSP_CHECK_NE(send_packet_result, AVERROR(EAGAIN));
++    // EAGAIN is also recoverable: never abort the host process on codec input.
+     OnError("avcodec_send_packet", send_packet_result, frame_id);
+     return;
+   }
+@@ -104,19 +129,31 @@ void Decoder::Decode(FrameId frame_id, const Decoder::Buffer& buffer) {
+     if (receive_frame_result == AVERROR(EAGAIN)) {
+       break;  // Decoder needs more input to produce another frame.
+     }
+-    const FrameId decoded_frame_id = DidReceiveFrameFromDecoder();
+     if (receive_frame_result < 0) {
+-      OnError("avcodec_receive_frame", receive_frame_result, decoded_frame_id);
+-      // Flush any remaining frames stuck in the decode queue to prevent
+-      // FrameId desynchronization on subsequent frames.
+-      while (!frames_decoding_.empty()) {
+-        const FrameId dropped_id = DidReceiveFrameFromDecoder();
+-        OnError("avcodec_receive_frame dropped pending frame",
+-                receive_frame_result, dropped_id);
+-      }
+-      avcodec_flush_buffers(context_.get());
++      // The decoder did not return a frame/tag. Report all pending identities;
++      // assigning this error to the next FIFO entry would shift future metadata.
++      FlushPendingFrames("avcodec_receive_frame", receive_frame_result);
++      return;
++    }
++    FrameId decoded_frame_id;
++#if LIBAVCODEC_VERSION_MAJOR >= 60
++    if (decoded_frame_->opaque_ref &&
++        decoded_frame_->opaque_ref->size == sizeof(decoded_frame_id)) {
++      std::memcpy(&decoded_frame_id, decoded_frame_->opaque_ref->data,
++                  sizeof(decoded_frame_id));
++    }
++#else
++    decoded_frame_id = FrameId(decoded_frame_->reordered_opaque);
++#endif
++    const auto found = std::find(frames_decoding_.begin(), frames_decoding_.end(),
++                                 decoded_frame_id);
++    if (found == frames_decoding_.end()) {
++      av_frame_unref(decoded_frame_.get());
++      FlushPendingFrames("missing or duplicate decoded identity", AVERROR_INVALIDDATA);
++      if (client_) client_->OnFatalError("Decoder did not preserve one FrameId per decoded frame");
+       return;
+     }
++    frames_decoding_.erase(found);
+     TRACE_FLOW_STEP(TraceCategory::kStandaloneReceiver, "Frame.Decode.End",
+                     decoded_frame_id);
+     if (client_) {
+@@ -170,6 +207,9 @@ bool Decoder::Initialize() {
+   // frame-threading support for VP8/VP9.
+   context_->thread_type = FF_THREAD_SLICE | FF_THREAD_FRAME;
+   context_->flags |= AV_CODEC_FLAG_LOW_DELAY;
++#if LIBAVCODEC_VERSION_MAJOR >= 60
++  context_->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
++#endif
+   const int open_result = avcodec_open2(context_.get(), codec_.get(), nullptr);
+   if (open_result < 0) {
+     HandleInitializationError("failed to open codec", open_result);
+@@ -191,12 +231,11 @@ bool Decoder::Initialize() {
+   return true;
+ }
+ 
+-FrameId Decoder::DidReceiveFrameFromDecoder() {
+-  const auto it = frames_decoding_.begin();
+-  OSP_CHECK(it != frames_decoding_.end());
+-  const auto frame_id = *it;
+-  frames_decoding_.erase(it);
+-  return frame_id;
++void Decoder::FlushPendingFrames(const char* what, int error) {
++  avcodec_flush_buffers(context_.get());
++  auto pending = std::move(frames_decoding_);
++  frames_decoding_.clear();
++  for (FrameId id : pending) OnError(what, error, id);
+ }
+ 
+ void Decoder::HandleInitializationError(const char* what, int av_errnum) {
+diff --git a/cast/standalone_receiver/decoder.h b/cast/standalone_receiver/decoder.h
+index bae8ff06..b2a41cfd 100644
+--- a/cast/standalone_receiver/decoder.h
++++ b/cast/standalone_receiver/decoder.h
+@@ -59,7 +59,10 @@ class Decoder {
+   // given `frame_id`. This will synchronously call Client::OnFrameDecoded()
+   // and/or Client::OnDecodeError() zero or more times with results. Note that
+   // some codecs will have data dependencies that require multiple encoded
+-  // frame's data before the first decoded frame can be generated.
++  // frames before the first decoded frame can be generated. Identity follows the
++  // packet through decoder reordering; output callbacks are not necessarily in
++  // input order. Each complete access unit must yield at most one decoded frame.
++  // Borrowed AVFrame planes are valid only for the duration of the callback.
+   void Decode(FrameId frame_id, const Buffer& buffer);
+ 
+  private:
+@@ -67,9 +70,8 @@ class Decoder {
+   // false if this failed (and the Client was notified).
+   bool Initialize();
+ 
+-  // Helper to get the FrameId that is associated with the next frame coming out
+-  // of the FFMPEG decoder.
+-  FrameId DidReceiveFrameFromDecoder();
++  // Release all pending decoder work and report each associated identity.
++  void FlushPendingFrames(const char* what, int error);
+ 
+   // Helper to handle a codec initialization error and notify the Client of the
+   // fatal error.
+diff --git a/cast/standalone_receiver/decoder_unittest.cc b/cast/standalone_receiver/decoder_unittest.cc
+new file mode 100644
+index 00000000..de71f5dc
+--- /dev/null
++++ b/cast/standalone_receiver/decoder_unittest.cc
+@@ -0,0 +1,124 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "cast/standalone_receiver/decoder.h"
++
++#include <algorithm>
++#include <cstring>
++#include <vector>
++
++#include "third_party/googletest/src/googletest/include/gtest/gtest.h"
++
++namespace openscreen::cast {
++namespace {
++// Tiny generated fixture: 24 16x16 YUV420P frames, luma=16+8*n, chroma=128.
++// ffmpeg -f lavfi -i 'nullsrc=s=16x16:r=30,geq=lum=16+N*8:cb=128:cr=128'
++// -frames:v 24 -c:v libx264 -pix_fmt yuv420p -qp 10
++// -x264-params 'bframes=2:b-adapt=0:keyint=30:min-keyint=30:scenecut=0:aud=1:repeat-headers=1'
++// -bsf:v filter_units=remove_types=6 -f h264 reordered.h264
++// The SEI encoder-identification string is omitted. No runtime encoder is needed.
++constexpr uint8_t kReorderedH264[] = {
++    0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x00, 0x00, 0x00, 0x01, 0x67, 0x64,
++    0x00, 0x0a, 0xac, 0xd9, 0x5e, 0xc0, 0x44, 0x00, 0x00, 0x03, 0x00, 0x04,
++    0x00, 0x00, 0x03, 0x00, 0xf0, 0x3c, 0x48, 0x96, 0x58, 0x00, 0x00, 0x00,
++    0x01, 0x68, 0xeb, 0xe0, 0x43, 0x2c, 0x8b, 0x00, 0x00, 0x01, 0x65, 0x88,
++    0x84, 0x00, 0xeb, 0xfe, 0xf7, 0x81, 0xbf, 0x32, 0xcb, 0x64, 0x3f, 0xb9,
++    0x00, 0x00, 0x00, 0x01, 0x09, 0x30, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x23,
++    0x6c, 0x6b, 0xc8, 0x37, 0xfa, 0xd6, 0x0f, 0xff, 0xc4, 0x24, 0x84, 0x7b,
++    0x00, 0x00, 0x00, 0x01, 0x09, 0x50, 0x00, 0x00, 0x01, 0x41, 0x9e, 0x41,
++    0x78, 0xa5, 0xbe, 0x81, 0x00, 0x00, 0x00, 0x01, 0x09, 0x50, 0x00, 0x00,
++    0x01, 0x01, 0x9e, 0x62, 0x6a, 0x48, 0xbf, 0xc1, 0x80, 0x00, 0x00, 0x00,
++    0x01, 0x09, 0x30, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x66, 0x49, 0xa8, 0x41,
++    0x68, 0x99, 0x4c, 0x0d, 0x7f, 0xc8, 0x37, 0xfa, 0xd6, 0x0f, 0xff, 0xc4,
++    0x23, 0x6b, 0xed, 0x00, 0x00, 0x00, 0x01, 0x09, 0x50, 0x00, 0x00, 0x01,
++    0x41, 0x9e, 0x84, 0x45, 0x11, 0x2d, 0x2f, 0xbe, 0x81, 0x00, 0x00, 0x00,
++    0x01, 0x09, 0x50, 0x00, 0x00, 0x01, 0x01, 0x9e, 0xa5, 0x6a, 0x48, 0xbf,
++    0xc1, 0x81, 0x00, 0x00, 0x00, 0x01, 0x09, 0x30, 0x00, 0x00, 0x01, 0x41,
++    0x9a, 0xa9, 0x49, 0xa8, 0x41, 0x6c, 0x99, 0x4c, 0x0d, 0x7f, 0xc8, 0x37,
++    0xfa, 0xd6, 0x0f, 0xff, 0xc4, 0x20, 0x4d, 0xed, 0x00, 0x00, 0x00, 0x01,
++    0x09, 0x50, 0x00, 0x00, 0x01, 0x41, 0x9e, 0xc7, 0x45, 0x15, 0x2d, 0x2f,
++    0xbe, 0x80, 0x00, 0x00, 0x00, 0x01, 0x09, 0x50, 0x00, 0x00, 0x01, 0x01,
++    0x9e, 0xe8, 0x6a, 0x48, 0xbf, 0xc1, 0x80, 0x00, 0x00, 0x00, 0x01, 0x09,
++    0x30, 0x00, 0x00, 0x01, 0x41, 0x9a, 0xec, 0x49, 0xa8, 0x41, 0x6c, 0x99,
++    0x4c, 0x0d, 0x7f, 0xc8, 0x37, 0xfa, 0xd6, 0x0f, 0xff, 0xc4, 0x10, 0x9e,
++    0xc1, 0x00, 0x00, 0x00, 0x01, 0x09, 0x50, 0x00, 0x00, 0x01, 0x41, 0x9f,
++    0x0a, 0x45, 0x15, 0x2d, 0x2f, 0xbe, 0x80, 0x00, 0x00, 0x00, 0x01, 0x09,
++    0x50, 0x00, 0x00, 0x01, 0x01, 0x9f, 0x2b, 0x6a, 0x48, 0xbf, 0xc1, 0x80,
++    0x00, 0x00, 0x00, 0x01, 0x09, 0x30, 0x00, 0x00, 0x01, 0x41, 0x9b, 0x2f,
++    0x49, 0xa8, 0x41, 0x6c, 0x99, 0x4c, 0x0d, 0x7f, 0xca, 0x69, 0x8f, 0x99,
++    0x5e, 0x0b, 0xd1, 0x00, 0x00, 0x00, 0x01, 0x09, 0x50, 0x00, 0x00, 0x01,
++    0x41, 0x9f, 0x4d, 0x45, 0x15, 0x2d, 0x2f, 0xbe, 0x81, 0x00, 0x00, 0x00,
++    0x01, 0x09, 0x50, 0x00, 0x00, 0x01, 0x01, 0x9f, 0x6e, 0x6a, 0x48, 0xbf,
++    0xc1, 0x81, 0x00, 0x00, 0x00, 0x01, 0x09, 0x30, 0x00, 0x00, 0x01, 0x41,
++    0x9b, 0x72, 0x49, 0xa8, 0x41, 0x6c, 0x99, 0x4c, 0x0d, 0x7f, 0xc8, 0x37,
++    0xfa, 0xd6, 0x0f, 0xff, 0xc4, 0x1d, 0xef, 0x10, 0x00, 0x00, 0x00, 0x01,
++    0x09, 0x50, 0x00, 0x00, 0x01, 0x41, 0x9f, 0x90, 0x45, 0x15, 0x2d, 0x2f,
++    0xbe, 0x80, 0x00, 0x00, 0x00, 0x01, 0x09, 0x50, 0x00, 0x00, 0x01, 0x01,
++    0x9f, 0xb1, 0x6a, 0x48, 0xbf, 0xc1, 0x81, 0x00, 0x00, 0x00, 0x01, 0x09,
++    0x30, 0x00, 0x00, 0x01, 0x41, 0x9b, 0xb5, 0x49, 0xa8, 0x41, 0x6c, 0x99,
++    0x4c, 0x0d, 0x7f, 0xc8, 0x37, 0xfa, 0xd6, 0x0f, 0xff, 0xc4, 0x22, 0x5d,
++    0xc4, 0x00, 0x00, 0x00, 0x01, 0x09, 0x50, 0x00, 0x00, 0x01, 0x41, 0x9f,
++    0xd3, 0x45, 0x15, 0x2d, 0x2f, 0xbe, 0x80, 0x00, 0x00, 0x00, 0x01, 0x09,
++    0x50, 0x00, 0x00, 0x01, 0x01, 0x9f, 0xf4, 0x6a, 0x48, 0xbf, 0xc1, 0x81,
++    0x00, 0x00, 0x00, 0x01, 0x09, 0x30, 0x00, 0x00, 0x01, 0x41, 0x9b, 0xf7,
++    0x49, 0xa8, 0x41, 0x6c, 0x99, 0x4c, 0x14, 0x4e, 0xbf, 0xc7, 0x83, 0xe0,
++    0x7b, 0x83, 0xbf, 0xff, 0x84, 0xa6, 0xae, 0x0f, 0xff, 0x00, 0x00, 0x00,
++    0x01, 0x09, 0x50, 0x00, 0x00, 0x01, 0x01, 0x9e, 0x16, 0x6a, 0x48, 0xbf,
++    0xc1, 0x81,
++};
++constexpr size_t kAccessUnits[] = {0, 60, 84, 100, 117, 147, 165, 182, 212, 230, 247, 277, 295, 312, 339, 357, 374, 404, 422, 439, 469, 487, 504, 537, 554};
++// FrameId is based on access-unit/decode order. Presentation order must reorder
++// these identities along with the pictures rather than advance a FIFO counter.
++constexpr int kPresentationOrder[] = {0, 2, 3, 1, 5, 6, 4, 8, 9, 7, 11, 12,
++                                      10, 14, 15, 13, 17, 18, 16, 20, 21, 19, 23, 22};
++
++class DecodedFrames : public Decoder::Client {
++ public:
++  void OnFrameDecoded(FrameId id, const AVFrame& frame) override {
++    ids.push_back(id);
++    luma.push_back(frame.data[0][0]);
++  }
++  void OnDecodeError(FrameId id, const std::string&) override { errors.push_back(id); }
++  void OnFatalError(const std::string& error) override { fatal.push_back(error); }
++  std::vector<FrameId> ids;
++  std::vector<uint8_t> luma;
++  std::vector<FrameId> errors;
++  std::vector<std::string> fatal;
++};
++TEST(DecoderTest, DelayedReorderedFramesKeepInputIdentity) {
++  Decoder decoder("h264");
++  DecodedFrames output;
++  decoder.set_client(&output);
++  for (size_t i = 0; i + 1 < std::size(kAccessUnits); ++i) {
++    Decoder::Buffer input;
++    input.Resize(kAccessUnits[i + 1] - kAccessUnits[i]);
++    std::memcpy(input.AsByteBuffer().data(), kReorderedH264 + kAccessUnits[i],
++                input.AsByteView().size());
++    decoder.Decode(FrameId(100 + i * 7), input);
++    // Input storage is immediately reused/freed; libavcodec owns buffered data.
++    std::fill(input.AsByteBuffer().begin(), input.AsByteBuffer().end(), 0);
++  }
++  ASSERT_TRUE(output.fatal.empty());
++  ASSERT_TRUE(output.errors.empty());
++  ASSERT_GE(output.ids.size(), 6u);  // Some final frames remain codec-buffered.
++  ASSERT_LE(output.ids.size(), std::size(kPresentationOrder));
++  for (size_t i = 0; i < output.ids.size(); ++i) {
++    EXPECT_EQ(output.ids[i], FrameId(100 + kPresentationOrder[i] * 7));
++    EXPECT_NEAR(output.luma[i], 16 + i * 8, 2);
++  }
++  EXPECT_NE(output.ids[1], FrameId(107));  // Explicitly catches the old FIFO.
++}
++TEST(DecoderTest, EmptyInputReportsOnlyItsOwnIdentity) {
++  Decoder decoder("h264");
++  DecodedFrames output;
++  decoder.set_client(&output);
++  Decoder::Buffer empty;
++  decoder.Decode(FrameId(73), empty);
++  ASSERT_EQ(output.errors.size(), 1u);
++  EXPECT_EQ(output.errors[0], FrameId(73));
++  EXPECT_TRUE(output.ids.empty());
++  EXPECT_TRUE(output.fatal.empty());
++}
++}  // namespace
++}  // namespace openscreen::cast
