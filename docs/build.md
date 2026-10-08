@@ -63,6 +63,13 @@ report and must not be inferred from these commands.
 
 ## Local development receivers
 
+In the Receiver tab, **Generate CA & Key…** creates a new private subfolder at the
+location you choose, writes a one-year RSA CA and private key, and selects both
+files. Existing credentials are never overwritten. Generation uses the core's
+statically linked crypto library and runs off the UI thread. Only paths are
+remembered in preferences; the private key stays in its owner-only file. Share
+`development-ca.crt` with senders; keep `development-ca.key` on the receiver.
+
 Create a new local development CA explicitly. This never runs as a build hook,
 never overwrites an existing credential directory, and does not touch credentials
 in a sibling project:
@@ -71,6 +78,8 @@ in a sibling project:
 python3 applescreen/scripts/create_development_credentials.py \
   --directory out/applescreen-development-credentials
 ```
+
+The command above is an alternative to the in-app action, for CLI workflows.
 
 In the receiver UI select `development-ca.crt` and `development-ca.key`. In an
 Applescreen sender select that same **certificate** in Developer CA; leave the
@@ -88,6 +97,25 @@ media paths, but a separate host is still needed to prove non-loopback local
 socket binding and network interoperability.
 
 ## Native Cast integration fixtures
+
+### Local Network permission
+
+Bonjour error `-65570` is `kDNSServiceErr_PolicyDenied`: allow Applescreen in
+**System Settings → Privacy & Security → Local Network**, then click **Refresh**
+(or **Start Receiver** for publication). The app now displays these instructions
+and retries failed discovery when it becomes active again. It does not poll or
+change privacy settings. The first request can fail before the user answers the
+OS prompt. The bundle already declares its usage description and
+`_googlecast._tcp` service.
+
+For reliable permission identity across rebuilds, set
+`-DAPPLESCREEN_CODESIGN_IDENTITY='Apple Development: …'` to an installed
+Apple-issued signing identity. The default remains ad-hoc (`-`) when none is
+available. This workspace had no valid signing identity installed, so actual
+privacy consent still needs to be granted by the user for the built application.
+See [Apple TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
+
+### Running native fixtures
 
 After building `applescreen_tests`, the existing file-source fixture writer can
 materialize its six small files for interoperability tests:

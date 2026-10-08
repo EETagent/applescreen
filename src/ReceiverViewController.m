@@ -10,11 +10,16 @@
 @property(nonatomic, strong) NSMutableArray<dispatch_block_t> *stopCompletions;
 @property(nonatomic, strong) NSTextField *nameField, *caField, *keyField, *portField, *status;
 @property(nonatomic, strong) NSPopUpButton *interfacePicker;
-@property(nonatomic, strong) NSButton *startButton, *caButton, *keyButton;
+@property(nonatomic, strong) NSButton *startButton, *caButton, *keyButton, *generateButton;
+@property(nonatomic) BOOL generatingCredentials;
 @property(nonatomic, strong) VideoWindowController *videoWindow;
 @property(nonatomic, copy) NSString *receiverID, *sessionName, *lastError;
 @end
 static void ReceiverEvent(void *context, const ASCastEvent *event);
+static void CredentialsCreated(void *context, CFStringRef error) {
+    void (^completion)(NSString *) = CFBridgingRelease(context);
+    completion((__bridge NSString *)error);
+}
 
 @implementation ReceiverViewController
 - (instancetype)initWithRuntime:(ASCastRuntime *)runtime {
@@ -39,10 +44,13 @@ static void ReceiverEvent(void *context, const ASCastEvent *event);
     [self.portField.widthAnchor constraintEqualToConstant:90].active = YES;
     self.caField = ASPathField(@"Development CA certificate (.pem or .crt)");
     self.keyField = ASPathField(@"Matching development CA private key");
+    self.caField.stringValue = [NSUserDefaults.standardUserDefaults stringForKey:@"receiverCAPath"] ?: @"";
+    self.keyField.stringValue = [NSUserDefaults.standardUserDefaults stringForKey:@"receiverKeyPath"] ?: @"";
     self.caButton = [NSButton buttonWithTitle:@"Choose…" target:self action:@selector(chooseCA:)];
     self.keyButton = [NSButton buttonWithTitle:@"Choose…" target:self action:@selector(chooseKey:)];
     self.startButton = [NSButton buttonWithTitle:@"Start Receiver" target:self action:@selector(startOrStop:)];
-    self.status = [NSTextField wrappingLabelWithString:@"Choose development credentials, then start listening."];
+    self.generateButton = [NSButton buttonWithTitle:@"Generate CA & Key…" target:self action:@selector(generateCredentials:)];
+    self.status = [NSTextField wrappingLabelWithString:@"Choose or generate development credentials, then start listening."];
     NSTextField *explanation = [NSTextField wrappingLabelWithString:
         @"Senders must trust the selected development CA. Device authentication remains enabled. Closing a playback window ends that stream while this receiver keeps listening."];
     explanation.textColor = NSColor.secondaryLabelColor;
@@ -52,19 +60,56 @@ static void ReceiverEvent(void *context, const ASCastEvent *event);
         ASFieldRow(@"Port", self.portField),
         ASFieldRow(@"Developer CA", ASButtons(@[self.caField, self.caButton])),
         ASFieldRow(@"CA key", ASButtons(@[self.keyField, self.keyButton])),
-        explanation, ASButtons(@[self.startButton]), self.status]);
+        explanation, ASButtons(@[self.generateButton, self.startButton]), self.status]);
 }
 - (void)chooseCA:(id)sender { ASChooseFile(self.view.window, self.caField, @[@"crt", @"pem"]); }
 - (void)chooseKey:(id)sender { ASChooseFile(self.view.window, self.keyField, @[@"key", @"pem"]); }
+- (void)generateCredentials:(id)sender {
+    if (self.generation || self.generatingCredentials || self.stopCompletions) return;
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    panel.canChooseDirectories = YES;
+    panel.canChooseFiles = NO;
+    panel.canCreateDirectories = YES;
+    panel.prompt = @"Generate Here";
+    panel.message = @"Create a new development CA and private key in a new subfolder. Share only development-ca.crt with senders.";
+    __weak ReceiverViewController *weakSelf = self;
+    [panel beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse result) {
+        ReceiverViewController *self = weakSelf;
+        if (!self || result != NSModalResponseOK || self.generation || self.stopCompletions) return;
+        NSURL *directory = [panel.URL URLByAppendingPathComponent:
+            [@"Applescreen-CA-" stringByAppendingString:NSUUID.UUID.UUIDString] isDirectory:YES];
+        self.generatingCredentials = YES;
+        self.status.stringValue = @"Generating development CA and private key…";
+        [self updateControls];
+        void (^done)(NSString *) = ^(NSString *error) {
+            ReceiverViewController *self = weakSelf;
+            if (!self) return;
+            self.generatingCredentials = NO;
+            if (self.stopCompletions) { [self stopSession]; return; }
+            if (error) self.status.stringValue = error;
+            else {
+                self.caField.stringValue = [directory URLByAppendingPathComponent:@"development-ca.crt"].path;
+                self.keyField.stringValue = [directory URLByAppendingPathComponent:@"development-ca.key"].path;
+                [NSUserDefaults.standardUserDefaults setObject:self.caField.stringValue forKey:@"receiverCAPath"];
+                [NSUserDefaults.standardUserDefaults setObject:self.keyField.stringValue forKey:@"receiverKeyPath"];
+                self.status.stringValue = @"Credentials created and selected. Share development-ca.crt with senders; keep the private key on this Mac.";
+            }
+            [self updateControls];
+        };
+        ASCastGenerateDeveloperCA((__bridge CFURLRef)directory, CredentialsCreated,
+                                 (__bridge_retained void *)[done copy]);
+    }];
+}
 - (void)updateControls {
     if (!self.isViewLoaded) return;
-    BOOL busy = self.generation != 0;
+    BOOL busy = self.generation != 0 || self.generatingCredentials || self.stopCompletions != nil;
     for (NSControl *control in @[self.nameField, self.caField, self.keyField, self.portField,
-                                 self.interfacePicker, self.caButton, self.keyButton]) control.enabled = !busy;
-    self.startButton.title = busy ? @"Stop Receiver" : @"Start Receiver";
-    self.startButton.enabled = self.stopCompletions == nil;
+                                 self.interfacePicker, self.caButton, self.keyButton, self.generateButton]) control.enabled = !busy;
+    self.startButton.title = self.generation ? @"Stop Receiver" : @"Start Receiver";
+    self.startButton.enabled = self.stopCompletions == nil && !self.generatingCredentials;
 }
 - (void)startOrStop:(id)sender {
+    if (self.generatingCredentials || self.stopCompletions) return;
     if (self.generation) {
         [self stopWithCompletion:^{}];
         return;
@@ -169,6 +214,11 @@ static void ReceiverEvent(void *context, const ASCastEvent *event);
     [self updateControls];
     [self.videoWindow closeWithoutStopping];
     self.videoWindow = nil;
+    // Termination must not interrupt an in-flight credential file transaction.
+    if (self.generatingCredentials) return;
+    [self stopSession];
+}
+- (void)stopSession {
     ASCastStopReceiver(self.runtime, ASInvokeCompletion, ASCompletionContext(^{
         self.generation = self.mediaGeneration = 0;
         self.status.stringValue = self.lastError ?: @"Receiver stopped.";

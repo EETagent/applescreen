@@ -284,6 +284,8 @@ in `out/applescreen-universal-package-inspection.json`.
 Physical line counts include blank lines/comments and count moved implementation
 once. No upstream dependency churn, omitted archive files, patch context or
 generated binary is counted as an application-code saving.
+These measurements describe migration commit `91c9503`; later requested features,
+including the in-app developer CA generator, are not part of that snapshot.
 
 | Category | Before | After |
 | --- | ---: | ---: |

@@ -16,6 +16,9 @@
 
 namespace applescreen {
 
+// User-facing diagnosis; policy denial requires user consent, not a busy retry.
+std::string CastBonjourErrorMessage(DNSServiceErrorType);
+
 // Missing optional value is a flag; an empty vector is an explicit empty value.
 // Keys are ASCII case-folded. Unknown values remain binary.
 using TxtRecord = std::map<std::string, std::optional<std::vector<uint8_t>>>;

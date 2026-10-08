@@ -77,6 +77,15 @@ AS_CAST_API ASCastSubmission ASCastSubmit(ASCastRuntime*, uint64_t generation,
                                          CMTime host_presentation_time);
 AS_CAST_API bool ASCastSupportsCodec(ASCastCodec);
 
+// Explicit user action, independent of a running session. Creates a NEW private
+// directory containing development-ca.crt and development-ca.key (PEM, one-year
+// RSA CA). Existing directories/files are never replaced. Work runs off main;
+// completion runs once on main with a borrowed error string, NULL on success.
+// The directory URL is copied before return. Share only the certificate with senders.
+typedef void (*ASCastCredentialsCallback)(void*, CFStringRef error);
+AS_CAST_API void ASCastGenerateDeveloperCA(CFURLRef directory,
+                                          ASCastCredentialsCallback, void*);
+
 typedef struct {
   const char* receiver_id; // Stable application UUID, shared by control and DNS.
   const char* name;

@@ -1,4 +1,5 @@
 #include "../native/ReceiverSession.h"
+#include "../native/cast.h"
 #include "../native/media/DecodedMedia.h"
 #include "../native/media/PlaybackSession.h"
 #include "../native/media/ReceiverTimeline.h"
@@ -13,10 +14,16 @@ extern "C" {
 #include <cstring>
 #include <condition_variable>
 #include <cstdio>
+#include <ctime>
 #include <deque>
 #include <fstream>
 #include <mutex>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <openssl/pem.h>
+#include <openssl/x509v3.h>
+#include "cast/common/public/trust_store.h"
+#include "cast/receiver/channel/static_credentials.h"
 
 #include "platform/api/task_runner.h"
 
@@ -78,6 +85,68 @@ ReceiverConfig Config() {
   value.developer_ca_path = "/private/tmp/applescreen-deliberately-missing-ca";
   value.developer_key_path = "/private/tmp/applescreen-deliberately-missing-key";
   return value;
+}
+
+void DeveloperCredentialsAreUsableAndNeverOverwrite() {
+  auto generate = [](NSURL* directory) {
+    struct Result { bool done = false; NSString* error = nil; } result;
+    ASCastGenerateDeveloperCA((__bridge CFURLRef)directory,
+      [](void* context, CFStringRef error) {
+        CHECK(NSThread.isMainThread);
+        auto& result = *static_cast<Result*>(context);
+        CHECK(!result.done);
+        result.error = [(__bridge NSString*)error copy];
+        result.done = true;
+      }, &result);
+    CHECK(!result.done);
+    const auto deadline = CFAbsoluteTimeGetCurrent() + 10;
+    while (!result.done) {
+      CHECK(CFAbsoluteTimeGetCurrent() < deadline);
+      CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
+    }
+    return result.error;
+  };
+  CHECK(generate([NSURL URLWithString:@"https://example.invalid/credentials"]));
+  NSURL* directory = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
+      URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
+  CHECK(generate([directory URLByAppendingPathComponent:@"missing-parent"]));
+  CHECK(!generate(directory));
+  NSURL* certificate_url = [directory URLByAppendingPathComponent:@"development-ca.crt"];
+  NSURL* key_url = [directory URLByAppendingPathComponent:@"development-ca.key"];
+  NSData* certificate_data = [NSData dataWithContentsOfURL:certificate_url];
+  NSData* key_data = [NSData dataWithContentsOfURL:key_url];
+  CHECK(certificate_data.length && key_data.length);
+  for (NSURL* url in @[directory, certificate_url, key_url]) {
+    struct stat status{};
+    CHECK(stat(url.fileSystemRepresentation, &status) == 0);
+    CHECK((status.st_mode & 0777) == (url == directory ? 0700 : 0600));
+  }
+  bssl::UniquePtr<BIO> cert_input(BIO_new_mem_buf(certificate_data.bytes, certificate_data.length));
+  bssl::UniquePtr<BIO> key_input(BIO_new_mem_buf(key_data.bytes, key_data.length));
+  bssl::UniquePtr<X509> cert(PEM_read_bio_X509(cert_input.get(), nullptr, nullptr, nullptr));
+  bssl::UniquePtr<EVP_PKEY> key(PEM_read_bio_PrivateKey(key_input.get(), nullptr, nullptr, nullptr));
+  CHECK(cert && key && EVP_PKEY_bits(key.get()) >= 2048);
+  CHECK(X509_check_private_key(cert.get(), key.get()) == 1 && X509_check_ca(cert.get()));
+  CHECK(X509_verify(cert.get(), key.get()) == 1);
+  CHECK(X509_cmp_current_time(X509_get0_notBefore(cert.get())) < 0);
+  CHECK(X509_cmp_current_time(X509_get0_notAfter(cert.get())) > 0);
+  const std::string_view certificate_pem(static_cast<const char*>(certificate_data.bytes), certificate_data.length);
+  auto trust = openscreen::cast::TrustStore::CreateInstanceFromPem(certificate_pem);
+  CHECK(trust);
+  auto credentials = openscreen::cast::GenerateCredentialsFromPem("generated-ca-test-device",
+      std::string_view(static_cast<const char*>(key_data.bytes), key_data.length), certificate_pem);
+  CHECK(credentials);
+  const time_t now = time(nullptr);
+  struct tm utc{};
+  CHECK(gmtime_r(&now, &utc));
+  const openscreen::cast::DateTime date{static_cast<uint16_t>(utc.tm_year + 1900),
+      static_cast<uint8_t>(utc.tm_mon + 1), static_cast<uint8_t>(utc.tm_mday),
+      static_cast<uint8_t>(utc.tm_hour), static_cast<uint8_t>(utc.tm_min), static_cast<uint8_t>(utc.tm_sec)};
+  CHECK(trust.value()->FindCertificatePath(credentials.value().provider->device_creds.certs, date));
+  CHECK(generate(directory));
+  CHECK([certificate_data isEqual:[NSData dataWithContentsOfURL:certificate_url]]);
+  CHECK([key_data isEqual:[NSData dataWithContentsOfURL:key_url]]);
+  CHECK([NSFileManager.defaultManager removeItemAtURL:directory error:nil]);
 }
 
 void InvalidStartIsOneFailureAndStoppable() {
@@ -333,6 +402,7 @@ void Av1UsesARealSoftwareDecoder() {
 
 int main() {
   @autoreleasepool {
+  DeveloperCredentialsAreUsableAndNeverOverwrite();
   InvalidStartIsOneFailureAndStoppable();
   StopBeforeReadyAndImmediateRestart();
   ReentrantStopDuringStarting();

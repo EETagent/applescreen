@@ -268,7 +268,7 @@ struct ASCastRuntime {
         [this, generation](DNSServiceErrorType error, std::string claimed) {
           runner->PostTask([this, generation, error, claimed = std::move(claimed)] {
             if (receiving.generation != generation || receiving.state != ASCastStarting) return;
-            if (error) { StopReceiver([]{}, "Bonjour registration failed: " + std::to_string(error)); return; }
+            if (error) { StopReceiver([]{}, applescreen::CastBonjourErrorMessage(error)); return; }
             receiver_info.friendly_name = claimed;
             receiver->UpdateReceiverInfo(receiver_info);
             receiving.state = ASCastReady;
@@ -293,8 +293,7 @@ ASCastRuntime* ASCastRuntimeCreate(void) {
     runtime->runner = &openscreen::PlatformClientPosix::GetInstance()->GetTaskRunner();
   });
   runtime->bonjour = std::make_unique<applescreen::CastBonjour>([runtime](DNSServiceErrorType error) {
-    runtime->Snapshot(runtime->browse_generation, @[],
-                      [NSString stringWithFormat:@"Bonjour error: %d", error]);
+    runtime->Snapshot(runtime->browse_generation, @[], Text(applescreen::CastBonjourErrorMessage(error)));
   });
   return runtime;
 }
@@ -358,14 +357,16 @@ void ASCastBrowse(ASCastRuntime* runtime, uint32_t interface_index,
       }
       runtime->Snapshot(generation, [services copy]);
     }, [runtime, generation](DNSServiceErrorType error) {
-      if (error) runtime->Snapshot(generation, @[],
-          [NSString stringWithFormat:@"Cannot browse Cast services: %d", error]);
+      if (error) runtime->Snapshot(generation, @[], Text(applescreen::CastBonjourErrorMessage(error)));
     });
 }
 void ASCastRefresh(ASCastRuntime* runtime) {
   if (!runtime || runtime->closing) return;
   // Refresh is discovery-only; CastBonjour starts a new native browse generation.
-  runtime->bonjour->Refresh();
+  const uint64_t generation = runtime->browse_generation.load();
+  runtime->bonjour->Refresh([runtime, generation](DNSServiceErrorType error) {
+    if (error) runtime->Snapshot(generation, @[], Text(applescreen::CastBonjourErrorMessage(error)));
+  });
 }
 void ASCastStopBrowsing(ASCastRuntime* runtime, ASCastCompletion callback, void* context) {
   if (!runtime || runtime->stopped) { Main(Completion(callback, context)); return; }

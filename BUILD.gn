@@ -12,6 +12,7 @@ source_set("cast_core") {
   sources = [
     "native/cast.h",
     "native/Runtime.mm",
+    "native/DeveloperCredentials.mm",
     "native/SenderSession.h",
     "native/SenderSession.mm",
     "native/ReceiverSession.h",
@@ -77,7 +78,7 @@ openscreen_executable("receiver_session_test") {
   testonly = true
   cflags = [ "-UNDEBUG" ]
   sources = [ "tests/receiver_session_test.mm" ]
-  deps = [ ":cast_core" ]
+  deps = [ ":cast_core", "//cast/receiver:channel" ]
 }
 
 # Reuse the complete upstream test source graph. Its codec-enabled macOS link

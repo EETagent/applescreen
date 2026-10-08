@@ -350,6 +350,34 @@ void FailureAndPublicationTest() {
   for (const auto& ref : fake.refs) assert(ref->cancelled);
 }
 
+void PermissionDenialCanRefreshAndRecover() {
+  FakeDns fake;
+  int errors = 0, snapshots = 0;
+  CastBonjour discovery([&](DNSServiceErrorType error) {
+    assert(error == kDNSServiceErr_PolicyDenied);
+    ++errors;
+  }, fake.Api());
+  assert(Await([&](auto done) {
+    discovery.StartBrowsing(0, [&](auto) { ++snapshots; }, done);
+  }) == 0);
+  auto denied = fake.Last(NativeRef::Browse);
+  FakeDns::Deliver(denied, [=] {
+    denied->browse(reinterpret_cast<DNSServiceRef>(denied), 0, 0,
+        kDNSServiceErr_PolicyDenied, nullptr, nullptr, nullptr, denied->context);
+  });
+  assert(errors == 1 && denied->cancelled);
+  fake.create_error = kDNSServiceErr_PolicyDenied;
+  assert(Await([&](auto done) { discovery.Refresh(done); }) == kDNSServiceErr_PolicyDenied);
+  fake.create_error = 0; // Permission granted: a fresh operation must work.
+  assert(Await([&](auto done) { discovery.Refresh(done); }) == 0);
+  auto recovered = fake.Last(NativeRef::Browse);
+  assert(recovered != denied && !recovered->cancelled && snapshots >= 3);
+  assert(CastBonjourErrorMessage(kDNSServiceErr_PolicyDenied).find("Local Network") != std::string::npos);
+  assert(CastBonjourErrorMessage(kDNSServiceErr_PolicyDenied).find("Refresh") != std::string::npos);
+  Stop(discovery);
+  for (const auto& ref : fake.refs) assert(ref->cancelled);
+}
+
 
 void ClaimedNameFailureTest() {
   for (bool invalid_name : {false, true}) {
@@ -476,6 +504,7 @@ int main(int argc, char** argv) {
   BrowserTest();
   FreshResolutionTest();
   FailureAndPublicationTest();
+  PermissionDenialCanRefreshAndRecover();
   ClaimedNameFailureTest();
   ResolveCancellationTest();
   std::puts("Bonjour behavior tests passed");

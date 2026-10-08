@@ -16,6 +16,7 @@
 @property(nonatomic, strong) NSTextField *fileField, *caField, *status;
 @property(nonatomic, strong) NSButton *connectButton, *fileButton, *caButton;
 @property(nonatomic, copy) NSString *lastMessage;
+@property(nonatomic) BOOL discoveryNeedsRetry;
 @end
 
 static void SenderEvent(void *context, const ASCastEvent *event);
@@ -63,6 +64,8 @@ static void DiscoveryEvent(void *context, CFArrayRef snapshot, CFStringRef error
         ASFieldRow(@"Developer CA", ASButtons(@[self.caField, self.caButton])),
         ASButtons(@[self.connectButton]), self.status]);
     [self updateControls];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(applicationBecameActive:)
+        name:NSApplicationDidBecomeActiveNotification object:NSApp];
     [self interfaceChanged:nil];
 }
 - (void)updateControls {
@@ -84,6 +87,12 @@ static void DiscoveryEvent(void *context, CFArrayRef snapshot, CFStringRef error
 - (void)chooseMedia:(id)sender { ASChooseFile(self.view.window, self.fileField, nil); }
 - (void)chooseCA:(id)sender { ASChooseFile(self.view.window, self.caField, @[@"pem", @"crt"]); }
 - (void)refresh:(id)sender { ASCastRefresh(self.runtime); }
+- (void)applicationBecameActive:(NSNotification *)notification {
+    // DNSService may reject the first operation while the privacy prompt is
+    // still open. Retry after the answer or after returning from Settings;
+    // never poll or repeatedly prompt when permission remains denied.
+    if (self.discoveryNeedsRetry) [self refresh:nil];
+}
 - (void)interfaceChanged:(id)sender {
     NSString *name = ASSelectedInterface(self.interfacePicker);
     unsigned index = name.length ? if_nametoindex(name.UTF8String) : 0;
@@ -95,6 +104,7 @@ static void DiscoveryEvent(void *context, CFArrayRef snapshot, CFStringRef error
     ASCastBrowse(self.runtime, index, DiscoveryEvent, (__bridge void *)self);
 }
 - (void)receiveSnapshot:(NSArray *)snapshot error:(NSString *)error {
+    self.discoveryNeedsRetry = error != nil;
     NSString *selectedID = self.receiverPicker.selectedItem.representedObject;
     NSMutableDictionary<NSString *, NSMutableArray *> *groups = [NSMutableDictionary dictionary];
     for (NSDictionary *candidate in snapshot) {

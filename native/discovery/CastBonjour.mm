@@ -51,6 +51,17 @@ void Complete(const CastBonjour::Completion& completion, DNSServiceErrorType err
 }
 }  // namespace
 
+std::string CastBonjourErrorMessage(DNSServiceErrorType error) {
+  if (error == kDNSServiceErr_PolicyDenied)
+    return "Local Network access is blocked. Allow Applescreen in System Settings > "
+           "Privacy & Security > Local Network, then click Refresh (or Start Receiver).";
+  if (error == kDNSServiceErr_ServiceNotRunning || error == kDNSServiceErr_DefunctConnection)
+    return "The Bonjour service is unavailable. Try Refresh again when the network service is available.";
+  if (error == kDNSServiceErr_BadInterfaceIndex)
+    return "The selected network interface is no longer available. Select another interface or Automatic.";
+  return "Bonjour error: " + std::to_string(error);
+}
+
 std::optional<TxtRecord> ParseCastTxt(std::span<const uint8_t> bytes) {
   TxtRecord result;
   while (!bytes.empty()) {
