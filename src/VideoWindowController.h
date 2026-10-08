@@ -1,13 +1,9 @@
-// VideoWindowController.h
-// Window controller for video playback
-
 #import <Cocoa/Cocoa.h>
-#import "MetalVideoView.h"
+#import <QuartzCore/QuartzCore.h>
 
-@interface VideoWindowController : NSWindowController
-
-@property (nonatomic, strong, readonly) MetalVideoView* videoView;
-
-- (instancetype)initWithWidth:(int)width height:(int)height title:(NSString*)title;
-
+@interface VideoWindowController : NSWindowController <NSWindowDelegate>
+- (instancetype)initWithLayer:(CALayer *)layer title:(NSString *)title
+                     onClose:(dispatch_block_t)onClose;
+// Programmatic close does not request a second media stop.
+- (void)closeWithoutStopping;
 @end

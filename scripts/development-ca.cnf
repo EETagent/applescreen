@@ -1,0 +1,14 @@
+[req]
+prompt = no
+distinguished_name = subject
+x509_extensions = ca
+
+[subject]
+CN = Applescreen Local Development Root
+O = Applescreen Development
+
+[ca]
+basicConstraints = critical, CA:true
+keyUsage = critical, digitalSignature, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always

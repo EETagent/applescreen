@@ -1,0 +1,98 @@
+# This directory is referenced by a generated symlink in a disposable upstream
+# integration checkout. The upstream .gn and root BUILD.gn remain unchanged.
+import("//gni/openscreen.gni")
+import("//cast/streaming/external_libraries.gni")
+
+assert(is_mac, "Applescreen's native core requires macOS")
+assert(have_ffmpeg && have_libopus && have_libvpx,
+       "The core requires the pinned FFmpeg, Opus and VPX libraries")
+
+source_set("cast_core") {
+  visibility = [ ":cast_library", ":sender_session_test", ":receiver_session_test", ":upstream_tests" ]
+  sources = [
+    "native/cast.h",
+    "native/Runtime.mm",
+    "native/SenderSession.h",
+    "native/SenderSession.mm",
+    "native/ReceiverSession.h",
+    "native/ReceiverSession.mm",
+    "native/discovery/CastBonjour.h",
+    "native/discovery/CastBonjour.mm",
+    "native/media/ReceiverTimeline.h",
+    "native/media/DecodedMedia.h",
+    "native/media/DecodedMedia.mm",
+    "native/media/PlaybackSession.h",
+    "native/media/PlaybackSession.mm",
+  ]
+  configs -= openscreen_remove_configs
+  configs += openscreen_add_configs
+  public_configs = openscreen_add_public_configs
+  include_dirs = [ "native" ] + ffmpeg_include_dirs
+  cflags = [ "-fvisibility=hidden", "-fblocks" ]
+  frameworks = [
+    "Foundation.framework",
+    "CoreFoundation.framework",
+    "CoreMedia.framework",
+    "CoreVideo.framework",
+    "CoreGraphics.framework",
+    "AVFoundation.framework",
+    "AudioToolbox.framework",
+    "VideoToolbox.framework",
+    "QuartzCore.framework",
+    "Security.framework",
+  ]
+  libs = [ "bz2", "z", "iconv" ]
+  public_deps = [ "//platform", "//cast/common:public", "//cast/streaming:common" ]
+  deps = [
+    "//platform:standalone_impl",
+    "//util",
+    "//cast/common:channel",
+    "//cast/common:certificate_boringssl",
+    "//cast/receiver:agent",
+    "//cast/receiver:channel",
+    "//cast/sender:channel",
+    "//cast/streaming:sender",
+    "//cast/streaming:receiver",
+    "//cast/standalone_common:ffmpeg",
+    "//cast/standalone_receiver:decoder",
+    "//cast/standalone_sender:streaming_encoders",
+  ]
+}
+
+shared_library("cast_library") {
+  output_name = "applescreen_cast"
+  deps = [ ":cast_core" ]
+  ldflags = [ "-Wl,-install_name,@rpath/libapplescreen_cast.dylib" ]
+}
+
+openscreen_executable("sender_session_test") {
+  testonly = true
+  cflags = [ "-UNDEBUG" ]
+  sources = [ "tests/sender_session_test.mm" ]
+  deps = [ ":cast_core" ]
+}
+
+openscreen_executable("receiver_session_test") {
+  include_dirs = ffmpeg_include_dirs
+  testonly = true
+  cflags = [ "-UNDEBUG" ]
+  sources = [ "tests/receiver_session_test.mm" ]
+  deps = [ ":cast_core" ]
+}
+
+# Reuse the complete upstream test source graph. Its codec-enabled macOS link
+# needs the same explicit app-owned FFmpeg framework configuration as the core.
+# No upstream demo executable or test source is replaced for this purpose.
+openscreen_executable("upstream_tests") {
+  testonly = true
+  deps = [ ":cast_core", "//:openscreen_unittests_all", "//test:test_main" ]
+}
+
+group("default") {
+  deps = [ ":cast_library" ]
+}
+
+group("portable_tests") {
+  testonly = true
+  deps = [ "tests:media_timeline_test" ]
+}

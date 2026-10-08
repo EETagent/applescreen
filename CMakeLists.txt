@@ -1,32 +1,26 @@
-cmake_minimum_required(VERSION 3.20)
-project(UniversalMultimediaStack)
-
-include(ExternalProject)
-
-set(CMAKE_OSX_DEPLOYMENT_TARGET "12.7.6" CACHE STRING "Minimum OS X deployment version" FORCE)
-
-include(ProcessorCount)
-ProcessorCount(PROCESSOR_COUNT)
-if(NOT PROCESSOR_COUNT EQUAL 0)
-    set(PROCESSOR_COUNT ${PROCESSOR_COUNT})
-else()
-    set(PROCESSOR_COUNT 4)
+cmake_minimum_required(VERSION 3.24)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "12.7.6" CACHE STRING "Minimum supported macOS version")
+project(Applescreen VERSION 0.2.0 LANGUAGES C CXX OBJC OBJCXX)
+if(NOT APPLE)
+    message(FATAL_ERROR "Applescreen requires macOS; the preparation tests also run independently with Python")
 endif()
-
-include(cmake/Utils.cmake)
-
-include(cmake/BuildOpus.cmake)
-include(cmake/BuildSDL3.cmake)
-include(cmake/BuildVPX.cmake)
-include(cmake/BuildAOM.cmake)
-
-include(cmake/BuildFFmpeg.cmake)
-
-include(cmake/BuildOpenscreen.cmake)
-
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Debug or Release" FORCE)
+endif()
+if(NOT CMAKE_BUILD_TYPE MATCHES "^(Debug|Release)$")
+    message(FATAL_ERROR "Supported configurations: Debug and Release")
+endif()
+if(NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "${CMAKE_HOST_SYSTEM_PROCESSOR}" CACHE STRING "arm64, x86_64, or arm64;x86_64" FORCE)
+endif()
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_OBJCXX_STANDARD 20)
+set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+find_package(Python3 3.9 REQUIRED COMPONENTS Interpreter)
+include(CTest)
+include(cmake/CastCore.cmake)
 add_subdirectory(src)
-
-add_custom_target(universal_stack ALL
-    DEPENDS libopus libsdl3 libvpx_lipo libaom_lipo ffmpeg_lipo openscreen_lipo
-    COMMENT "All universal binaries built successfully in ${CMAKE_BINARY_DIR}/install"
-)
+if(BUILD_TESTING)
+    include(cmake/Tests.cmake)
+endif()

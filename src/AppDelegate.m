@@ -1,86 +1,65 @@
-// AppDelegate.m
-// Main application delegate with tabbed interface
-
 #import "AppDelegate.h"
+#import "FormRows.h"
+#import "ReceiverViewController.h"
+#import "SenderViewController.h"
+#include "cast.h"
 
 @interface AppDelegate ()
-
-@property (nonatomic, strong) NSWindow* mainWindow;
-@property (nonatomic, strong) NSTabView* tabView;
-@property (nonatomic, strong) ReceiverViewController* receiverViewController;
-@property (nonatomic, strong) SenderViewController* senderViewController;
-
+@property(nonatomic) ASCastRuntime *runtime;
+@property(nonatomic, strong) NSWindow *mainWindow;
+@property(nonatomic, strong) ReceiverViewController *receiver;
+@property(nonatomic, strong) SenderViewController *sender;
+@property(nonatomic) BOOL terminationPending;
 @end
-
 @implementation AppDelegate
-
-- (void)applicationDidFinishLaunching:(NSNotification*)notification {
-    [self createMainWindow];
-}
-
-- (void)createMainWindow {
-    NSRect frame = NSMakeRect(200, 200, 520, 400);
-    self.mainWindow = [[NSWindow alloc] initWithContentRect:frame
-                                                  styleMask:NSWindowStyleMaskTitled |
-                                                           NSWindowStyleMaskClosable |
-                                                           NSWindowStyleMaskMiniaturizable
-                                                    backing:NSBackingStoreBuffered
-                                                      defer:NO];
+- (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    self.runtime = ASCastRuntimeCreate();
+    if (!self.runtime) {
+        NSAlert *alert = [NSAlert new];
+        alert.messageText = @"Cannot create the Cast runtime.";
+        [alert runModal];
+        [NSApp terminate:nil];
+        return;
+    }
+    self.receiver = [[ReceiverViewController alloc] initWithRuntime:self.runtime];
+    self.sender = [[SenderViewController alloc] initWithRuntime:self.runtime];
+    NSTabViewController *tabs = [NSTabViewController new];
+    tabs.tabStyle = NSTabViewControllerTabStyleSegmentedControlOnTop;
+    NSTabViewItem *receiveTab = [NSTabViewItem tabViewItemWithViewController:self.receiver];
+    receiveTab.label = @"Receiver";
+    NSTabViewItem *sendTab = [NSTabViewItem tabViewItemWithViewController:self.sender];
+    sendTab.label = @"Sender";
+    [tabs addTabViewItem:receiveTab];
+    [tabs addTabViewItem:sendTab];
+    self.mainWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 720, 460)
+        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable |
+                  NSWindowStyleMaskResizable backing:NSBackingStoreBuffered defer:NO];
     self.mainWindow.title = @"Applescreen";
     self.mainWindow.delegate = self;
-
-    self.tabView = [[NSTabView alloc] initWithFrame:NSMakeRect(0, 0, 520, 400)];
-    self.tabView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-
-    NSTabViewItem* receiverTab = [[NSTabViewItem alloc] initWithIdentifier:@"receiver"];
-    receiverTab.label = @"Receiver";
-    self.receiverViewController = [[ReceiverViewController alloc] init];
-    self.receiverViewController.delegate = self;
-    receiverTab.view = self.receiverViewController.view;
-    [self.tabView addTabViewItem:receiverTab];
-
-    NSTabViewItem* senderTab = [[NSTabViewItem alloc] initWithIdentifier:@"sender"];
-    senderTab.label = @"Sender";
-    self.senderViewController = [[SenderViewController alloc] init];
-    self.senderViewController.delegate = self;
-    senderTab.view = self.senderViewController.view;
-    [self.tabView addTabViewItem:senderTab];
-
-    [self.mainWindow.contentView addSubview:self.tabView];
+    self.mainWindow.releasedWhenClosed = NO;
+    self.mainWindow.contentViewController = tabs;
+    self.mainWindow.contentMinSize = NSMakeSize(660, 420);
+    [self.mainWindow center];
     [self.mainWindow makeKeyAndOrderFront:nil];
 }
-
-#pragma mark - ReceiverViewControllerDelegate
-
-- (void)receiverDidUpdateStatus:(NSString*)status {
-    NSLog(@"Receiver: %@", status);
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)application {
+    if (!self.runtime) return NSTerminateNow;
+    if (self.terminationPending) return NSTerminateLater;
+    self.terminationPending = YES;
+    // Main remains available for capture/native renderer completion callbacks.
+    [self.sender stopWithCompletion:^{
+        [self.receiver stopWithCompletion:^{
+            ASCastRuntimeStop(self.runtime, ASInvokeCompletion, ASCompletionContext(^{
+                ASCastRuntimeDestroy(self.runtime);
+                self.runtime = NULL;
+                [application replyToApplicationShouldTerminate:YES];
+            }));
+        }];
+    }];
+    return NSTerminateLater;
 }
-
-#pragma mark - SenderViewControllerDelegate
-
-- (void)senderDidUpdateStatus:(NSString*)status {
-    NSLog(@"Sender: %@", status);
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)application { return YES; }
+- (void)windowWillClose:(NSNotification *)notification {
+    if (notification.object == self.mainWindow) [NSApp terminate:nil];
 }
-
-#pragma mark - NSApplicationDelegate
-
-- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
-    return YES;
-}
-
-- (void)applicationWillTerminate:(NSNotification*)notification {
-    [self.receiverViewController stopReceiver];
-    [self.senderViewController stopDiscovery];
-}
-
-#pragma mark - NSWindowDelegate
-
-- (void)windowWillClose:(NSNotification*)notification {
-    if (notification.object == self.mainWindow) {
-        [self.receiverViewController stopReceiver];
-        [self.senderViewController stopDiscovery];
-        [NSApp terminate:nil];
-    }
-}
-
 @end

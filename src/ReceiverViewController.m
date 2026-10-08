@@ -1,448 +1,184 @@
-// ReceiverViewController.m
-
 #import "ReceiverViewController.h"
-
-static void on_window_open(void* user_data, const CastWindowConfig* config);
-static void on_window_close(void* user_data);
-static void on_window_resize(void* user_data, int width, int height);
-static void on_video_frame(void* user_data, const CastVideoFrame* frame);
-static void on_audio_frame(void* user_data, const CastAudioFrame* frame);
-static void on_error(void* user_data, int error_code, const char* error_message);
+#import "FormRows.h"
+#import "VideoWindowController.h"
+#include <net/if.h>
 
 @interface ReceiverViewController ()
-
-@property (nonatomic, strong) NSTextField* interfaceField;
-@property (nonatomic, strong) NSTextField* certPathField;
-@property (nonatomic, strong) NSTextField* keyPathField;
-@property (nonatomic, strong) NSTextField* friendlyNameField;
-@property (nonatomic, strong) NSButton* startButton;
-@property (nonatomic, strong) NSButton* stopButton;
-@property (nonatomic, strong) NSTextField* statusLabel;
-
-@property (nonatomic, strong) VideoWindowController* videoWindowController;
-@property (nonatomic, assign) CastReceiver* receiver;
-@property (nonatomic, assign) AudioRingBuffer audioBuffer;
-@property (nonatomic, assign) AudioQueueRef audioQueue;
-@property (nonatomic, assign) int audioSampleRate;
-@property (nonatomic, assign) int audioChannels;
-
+@property(nonatomic) ASCastRuntime *runtime;
+@property(nonatomic) ASCastState state;
+@property(nonatomic) uint64_t generation, mediaGeneration;
+@property(nonatomic, strong) NSMutableArray<dispatch_block_t> *stopCompletions;
+@property(nonatomic, strong) NSTextField *nameField, *caField, *keyField, *portField, *status;
+@property(nonatomic, strong) NSPopUpButton *interfacePicker;
+@property(nonatomic, strong) NSButton *startButton, *caButton, *keyButton;
+@property(nonatomic, strong) VideoWindowController *videoWindow;
+@property(nonatomic, copy) NSString *receiverID, *sessionName, *lastError;
 @end
+static void ReceiverEvent(void *context, const ASCastEvent *event);
 
 @implementation ReceiverViewController
-
+- (instancetype)initWithRuntime:(ASCastRuntime *)runtime {
+    self = [super initWithNibName:nil bundle:nil];
+    if (self) {
+        _runtime = runtime;
+        _state = ASCastIdle;
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        _receiverID = [defaults stringForKey:@"receiverID"];
+        if (!_receiverID.length) {
+            _receiverID = [[[NSUUID.UUID UUIDString] stringByReplacingOccurrencesOfString:@"-" withString:@""] lowercaseString];
+            [defaults setObject:_receiverID forKey:@"receiverID"];
+        }
+    }
+    return self;
+}
 - (void)loadView {
-    self.view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 500, 300)];
-    [self setupUI];
+    self.nameField = [NSTextField textFieldWithString:[NSString stringWithFormat:@"Applescreen on %@", NSProcessInfo.processInfo.hostName]];
+    [self.nameField.widthAnchor constraintGreaterThanOrEqualToConstant:280].active = YES;
+    self.interfacePicker = ASInterfacePicker(nil, NULL);
+    self.portField = [NSTextField textFieldWithString:@"8010"];
+    [self.portField.widthAnchor constraintEqualToConstant:90].active = YES;
+    self.caField = ASPathField(@"Development CA certificate (.pem or .crt)");
+    self.keyField = ASPathField(@"Matching development CA private key");
+    self.caButton = [NSButton buttonWithTitle:@"Choose…" target:self action:@selector(chooseCA:)];
+    self.keyButton = [NSButton buttonWithTitle:@"Choose…" target:self action:@selector(chooseKey:)];
+    self.startButton = [NSButton buttonWithTitle:@"Start Receiver" target:self action:@selector(startOrStop:)];
+    self.status = [NSTextField wrappingLabelWithString:@"Choose development credentials, then start listening."];
+    NSTextField *explanation = [NSTextField wrappingLabelWithString:
+        @"Senders must trust the selected development CA. Device authentication remains enabled. Closing a playback window ends that stream while this receiver keeps listening."];
+    explanation.textColor = NSColor.secondaryLabelColor;
+    self.view = ASForm(@[
+        ASFieldRow(@"Receiver name", self.nameField),
+        ASFieldRow(@"Interface", self.interfacePicker),
+        ASFieldRow(@"Port", self.portField),
+        ASFieldRow(@"Developer CA", ASButtons(@[self.caField, self.caButton])),
+        ASFieldRow(@"CA key", ASButtons(@[self.keyField, self.keyButton])),
+        explanation, ASButtons(@[self.startButton]), self.status]);
 }
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    audio_ring_buffer_init(&_audioBuffer);
+- (void)chooseCA:(id)sender { ASChooseFile(self.view.window, self.caField, @[@"crt", @"pem"]); }
+- (void)chooseKey:(id)sender { ASChooseFile(self.view.window, self.keyField, @[@"key", @"pem"]); }
+- (void)updateControls {
+    if (!self.isViewLoaded) return;
+    BOOL busy = self.generation != 0;
+    for (NSControl *control in @[self.nameField, self.caField, self.keyField, self.portField,
+                                 self.interfacePicker, self.caButton, self.keyButton]) control.enabled = !busy;
+    self.startButton.title = busy ? @"Stop Receiver" : @"Start Receiver";
+    self.startButton.enabled = self.stopCompletions == nil;
 }
-
-- (void)setupUI {
-    NSView* view = self.view;
-    CGFloat y = 250;
-    CGFloat labelWidth = 120;
-    CGFloat fieldX = 130;
-    CGFloat fieldWidth = 350;
-
-    // Interface name
-    NSTextField* ifaceLabel = [NSTextField labelWithString:@"Interface:"];
-    ifaceLabel.frame = NSMakeRect(10, y, labelWidth, 22);
-    [view addSubview:ifaceLabel];
-
-    self.interfaceField = [[NSTextField alloc] initWithFrame:NSMakeRect(fieldX, y, fieldWidth, 22)];
-    self.interfaceField.stringValue = @"en0";
-    self.interfaceField.placeholderString = @"e.g., en0";
-    [view addSubview:self.interfaceField];
-    y -= 35;
-
-    // Certificate path
-    NSTextField* certLabel = [NSTextField labelWithString:@"Certificate:"];
-    certLabel.frame = NSMakeRect(10, y, labelWidth, 22);
-    [view addSubview:certLabel];
-
-    self.certPathField = [[NSTextField alloc] initWithFrame:NSMakeRect(fieldX, y, fieldWidth, 22)];
-    self.certPathField.stringValue = @"./generated_root_cast_receiver.crt";
-    self.certPathField.placeholderString = @"Path to .pem certificate";
-    [view addSubview:self.certPathField];
-    y -= 35;
-
-    // Private key path
-    NSTextField* keyLabel = [NSTextField labelWithString:@"Private Key:"];
-    keyLabel.frame = NSMakeRect(10, y, labelWidth, 22);
-    [view addSubview:keyLabel];
-
-    self.keyPathField = [[NSTextField alloc] initWithFrame:NSMakeRect(fieldX, y, fieldWidth, 22)];
-    self.keyPathField.stringValue = @"./generated_root_cast_receiver.key";
-    self.keyPathField.placeholderString = @"Path to .pem private key";
-    [view addSubview:self.keyPathField];
-    y -= 35;
-
-    // Friendly name
-    NSTextField* nameLabel = [NSTextField labelWithString:@"Friendly Name:"];
-    nameLabel.frame = NSMakeRect(10, y, labelWidth, 22);
-    [view addSubview:nameLabel];
-
-    self.friendlyNameField = [[NSTextField alloc] initWithFrame:NSMakeRect(fieldX, y, fieldWidth, 22)];
-    self.friendlyNameField.stringValue = @"MacCastReceiver";
-    [view addSubview:self.friendlyNameField];
-    y -= 50;
-
-    // Buttons
-    self.startButton = [[NSButton alloc] initWithFrame:NSMakeRect(130, y, 100, 32)];
-    self.startButton.title = @"Start";
-    self.startButton.bezelStyle = NSBezelStyleRounded;
-    self.startButton.target = self;
-    self.startButton.action = @selector(startReceiver);
-    [view addSubview:self.startButton];
-
-    self.stopButton = [[NSButton alloc] initWithFrame:NSMakeRect(250, y, 100, 32)];
-    self.stopButton.title = @"Stop";
-    self.stopButton.bezelStyle = NSBezelStyleRounded;
-    self.stopButton.target = self;
-    self.stopButton.action = @selector(stopReceiver);
-    self.stopButton.enabled = NO;
-    [view addSubview:self.stopButton];
-    y -= 50;
-
-    // Status label
-    self.statusLabel = [NSTextField labelWithString:@"Status: Stopped"];
-    self.statusLabel.frame = NSMakeRect(10, y, 480, 22);
-    self.statusLabel.alignment = NSTextAlignmentCenter;
-    [view addSubview:self.statusLabel];
-}
-
-- (BOOL)isRunning {
-    return self.receiver != NULL && cast_receiver_is_running(self.receiver);
-}
-
-- (void)startReceiver {
-    NSString* interface = self.interfaceField.stringValue;
-    NSString* certPath = self.certPathField.stringValue;
-    NSString* keyPath = self.keyPathField.stringValue;
-    NSString* friendlyName = self.friendlyNameField.stringValue;
-
-    if (interface.length == 0) {
-        [self showError:@"Please enter an interface name"];
+- (void)startOrStop:(id)sender {
+    if (self.generation) {
+        [self stopWithCompletion:^{}];
         return;
     }
-    if (certPath.length == 0 || keyPath.length == 0) {
-        [self showError:@"Please provide certificate and private key paths"];
+    NSString *interface = ASSelectedInterface(self.interfacePicker);
+    unsigned index = interface.length ? if_nametoindex(interface.UTF8String) : 0;
+    if (interface.length && !index) {
+        self.status.stringValue = @"The selected interface is no longer available.";
         return;
     }
-
-    CastReceiverConfig config = {
-        .interface_name = interface.UTF8String,
-        .certificate_path = certPath.UTF8String,
-        .private_key_path = keyPath.UTF8String,
-        .friendly_name = friendlyName.UTF8String,
-        .model_name = "mac_cast_receiver",
-        .enable_discovery = true,
-        .enable_dscp = true
+    NSScanner *scanner = [NSScanner scannerWithString:self.portField.stringValue];
+    int port = 0;
+    if (![scanner scanInt:&port] || !scanner.isAtEnd || port < 1 || port > UINT16_MAX) {
+        self.status.stringValue = @"Enter a port from 1 to 65535.";
+        return;
+    }
+    if (!self.nameField.stringValue.length || !self.caField.stringValue.length || !self.keyField.stringValue.length) {
+        self.status.stringValue = @"A receiver name, development CA and matching CA key are required.";
+        return;
+    }
+    self.lastError = nil;
+    self.sessionName = [self.nameField.stringValue copy];
+    NSScreen *screen = self.view.window.screen ?: NSScreen.mainScreen;
+    NSSize size = screen.frame.size;
+    CGFloat scale = screen.backingScaleFactor;
+    ASCastReceiverConfig config = {
+        .receiver_id = self.receiverID.UTF8String, .name = self.sessionName.UTF8String,
+        .developer_ca_path = self.caField.stringValue.UTF8String,
+        .developer_key_path = self.keyField.stringValue.UTF8String,
+        .interface_index = index, .port = (uint16_t)port,
+        .display_width = (int)(size.width * scale), .display_height = (int)(size.height * scale),
+        .max_fps = 60,
     };
-
-    CastReceiverCallbacks callbacks = {
-        .user_data = (__bridge void*)self,
-        .on_window_open = on_window_open,
-        .on_window_close = on_window_close,
-        .on_window_resize = on_window_resize,
-        .on_video_frame = on_video_frame,
-        .on_audio_frame = on_audio_frame,
-        .on_error = on_error
-    };
-
-    self.receiver = cast_receiver_create(&config, &callbacks);
-    if (!self.receiver) {
-        [self showError:@"Failed to create receiver"];
-        return;
-    }
-
-    int result = cast_receiver_start(self.receiver);
-    if (result != 0) {
-        cast_receiver_destroy(self.receiver);
-        self.receiver = NULL;
-        [self showError:@"Failed to start receiver"];
-        return;
-    }
-
-    self.startButton.enabled = NO;
-    self.stopButton.enabled = YES;
-    [self updateStatus:@"Running - Waiting for connection..."];
+    self.generation = ASCastStartReceiver(self.runtime, config, ReceiverEvent, (__bridge void *)self);
+    if (!self.generation) self.status.stringValue = @"The receiver is still stopping. Try again when it is idle.";
+    [self updateControls];
 }
-
-- (void)stopReceiver {
-    if (self.receiver) {
-        cast_receiver_stop(self.receiver);
-        cast_receiver_destroy(self.receiver);
-        self.receiver = NULL;
-    }
-
-    [self stopAudio];
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.videoWindowController close];
-        self.videoWindowController = nil;
-
-        self.startButton.enabled = YES;
-        self.stopButton.enabled = NO;
-        [self updateStatus:@"Stopped"];
-    });
-}
-
-- (void)showError:(NSString*)message {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSAlert* alert = [[NSAlert alloc] init];
-        alert.messageText = @"Error";
-        alert.informativeText = message;
-        alert.alertStyle = NSAlertStyleWarning;
-        [alert runModal];
-    });
-}
-
-- (void)updateStatus:(NSString*)status {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.statusLabel.stringValue = [NSString stringWithFormat:@"Status: %@", status];
-        if ([self.delegate respondsToSelector:@selector(receiverDidUpdateStatus:)]) {
-            [self.delegate receiverDidUpdateStatus:status];
-        }
-    });
-}
-
-- (void)openVideoWindowWithWidth:(int)width height:(int)height title:(const char*)title {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSString* titleStr = title ? [NSString stringWithUTF8String:title] : @"Cast Video";
-        self.videoWindowController = [[VideoWindowController alloc] initWithWidth:width
-                                                                           height:height
-                                                                            title:titleStr];
-        [self.videoWindowController showWindow:nil];
-        [self updateStatus:@"Streaming..."];
-    });
-}
-
-- (void)closeVideoWindow {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.videoWindowController close];
-        self.videoWindowController = nil;
-
-        if ([self isRunning]) {
-            [self updateStatus:@"Running - Waiting for connection..."];
-        }
-    });
-
-    [self stopAudio];
-}
-
-- (void)resizeVideoWindowToWidth:(int)width height:(int)height {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.videoWindowController) {
-            NSRect frame = self.videoWindowController.window.frame;
-            frame.size = NSMakeSize(width, height);
-            [self.videoWindowController.window setFrame:frame display:YES animate:YES];
-        }
-    });
-}
-
-- (void)displayVideoFrame:(const CastVideoFrame*)frame {
-    if (!self.videoWindowController || frame->format != kPixelFormatYUV420P) {
-        return;
-    }
-
-    // Copy frame data to avoid race conditions
-    int width = frame->width;
-    int height = frame->height;
-    int yLineSize = frame->line_sizes[0];
-    int uLineSize = frame->line_sizes[1];
-    int vLineSize = frame->line_sizes[2];
-
-    size_t ySize = yLineSize * height;
-    size_t uvSize = uLineSize * (height / 2);
-
-    uint8_t* yCopy = malloc(ySize);
-    uint8_t* uCopy = malloc(uvSize);
-    uint8_t* vCopy = malloc(uvSize);
-
-    memcpy(yCopy, frame->planes[0], ySize);
-    memcpy(uCopy, frame->planes[1], uvSize);
-    memcpy(vCopy, frame->planes[2], uvSize);
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.videoWindowController.videoView updateTexturesWithYPlane:yCopy
-                                                             yLineSize:yLineSize
-                                                                uPlane:uCopy
-                                                             uLineSize:uLineSize
-                                                                vPlane:vCopy
-                                                             vLineSize:vLineSize
-                                                                 width:width
-                                                                height:height];
-        [self.videoWindowController.videoView render];
-
-        free(yCopy);
-        free(uCopy);
-        free(vCopy);
-    });
-}
-
-// Audio callback for AudioQueue
-static void audioQueueCallback(void* userData, AudioQueueRef queue, AudioQueueBufferRef buffer) {
-    ReceiverViewController* self = (__bridge ReceiverViewController*)userData;
-
-    size_t read = audio_ring_buffer_read(&self->_audioBuffer, buffer->mAudioData, buffer->mAudioDataBytesCapacity);
-    buffer->mAudioDataByteSize = (UInt32)read;
-
-    if (read < buffer->mAudioDataBytesCapacity) {
-        // Fill remainder with silence
-        memset((uint8_t*)buffer->mAudioData + read, 0, buffer->mAudioDataBytesCapacity - read);
-        buffer->mAudioDataByteSize = buffer->mAudioDataBytesCapacity;
-    }
-
-    AudioQueueEnqueueBuffer(queue, buffer, 0, NULL);
-}
-
-- (void)setupAudioWithSampleRate:(int)sampleRate channels:(int)channels {
-    if (self.audioQueue && self.audioSampleRate == sampleRate && self.audioChannels == channels) {
-        return;
-    }
-
-    [self stopAudio];
-
-    self.audioSampleRate = sampleRate;
-    self.audioChannels = channels;
-
-    AudioStreamBasicDescription format = {
-        .mSampleRate = (Float64)sampleRate,
-        .mFormatID = kAudioFormatLinearPCM,
-        .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-        .mBytesPerPacket = 4 * channels,
-        .mFramesPerPacket = 1,
-        .mBytesPerFrame = 4 * channels,
-        .mChannelsPerFrame = channels,
-        .mBitsPerChannel = 32,
-    };
-
-    OSStatus status = AudioQueueNewOutput(&format, audioQueueCallback, (__bridge void*)self,
-                                          NULL, NULL, 0, &_audioQueue);
-    if (status != noErr) {
-        NSLog(@"Failed to create audio queue: %d", (int)status);
-        return;
-    }
-
-    // Create and enqueue buffers
-    for (int i = 0; i < 3; i++) {
-        AudioQueueBufferRef buffer;
-        // Buffer for ~20ms of audio
-        UInt32 bufferSize = sampleRate * channels * 4 / 50;
-        AudioQueueAllocateBuffer(self.audioQueue, bufferSize, &buffer);
-        buffer->mAudioDataByteSize = bufferSize;
-        memset(buffer->mAudioData, 0, bufferSize);
-        AudioQueueEnqueueBuffer(self.audioQueue, buffer, 0, NULL);
-    }
-
-    AudioQueueStart(self.audioQueue, NULL);
-}
-
-- (void)stopAudio {
-    if (self.audioQueue) {
-        AudioQueueStop(self.audioQueue, true);
-        AudioQueueDispose(self.audioQueue, true);
-        self.audioQueue = NULL;
-    }
-}
-
-- (void)handleAudioFrame:(const CastAudioFrame*)frame {
-    [self setupAudioWithSampleRate:frame->sample_rate channels:frame->channels];
-
-    // Convert to float if needed and write to ring buffer
-    if (frame->format == kAudioFormatFloat) {
-        audio_ring_buffer_write(&_audioBuffer, frame->planes[0], frame->plane_sizes[0]);
-    } else if (frame->format == kAudioFormatPlanarFloat) {
-        // Interleave planar float data
-        int samples = frame->samples_per_channel;
-        int channels = frame->channels;
-        size_t bufferSize = samples * channels * sizeof(float);
-        float* interleaved = malloc(bufferSize);
-
-        for (int s = 0; s < samples; s++) {
-            for (int c = 0; c < channels && c < frame->plane_count; c++) {
-                const float* plane = (const float*)frame->planes[c];
-                interleaved[s * channels + c] = plane[s];
+- (void)receiveEvent:(const ASCastEvent *)event {
+    if (event->generation != self.generation) return;
+    self.state = event->state;
+    switch (event->state) {
+        case ASCastStarting:
+            self.status.stringValue = @"Opening listeners and publishing receiver…";
+            break;
+        case ASCastReady:
+            self.lastError = [(__bridge NSString *)event->error copy];
+            self.status.stringValue = self.lastError.length ?
+                [NSString stringWithFormat:@"Stream ended: %@ Listening for a new connection.", self.lastError] :
+                @"Listening for Cast connections.";
+            [self.videoWindow closeWithoutStopping];
+            self.videoWindow = nil;
+            self.mediaGeneration = event->media_generation;
+            break;
+        case ASCastStreaming: {
+            self.lastError = nil;
+            self.status.stringValue = event->video ? @"Receiving video" : @"Receiving audio";
+            if (event->audio && event->video) self.status.stringValue = @"Receiving audio and video";
+            if (self.mediaGeneration != event->media_generation || !event->video_layer) {
+                [self.videoWindow closeWithoutStopping];
+                self.videoWindow = nil;
             }
-        }
-
-        audio_ring_buffer_write(&_audioBuffer, (uint8_t*)interleaved, bufferSize);
-        free(interleaved);
-    } else if (frame->format == kAudioFormatS16) {
-        // Convert S16 to float
-        int samples = frame->samples_per_channel * frame->channels;
-        size_t bufferSize = samples * sizeof(float);
-        float* floatData = malloc(bufferSize);
-        const int16_t* s16Data = (const int16_t*)frame->planes[0];
-
-        for (int i = 0; i < samples; i++) {
-            floatData[i] = s16Data[i] / 32768.0f;
-        }
-
-        audio_ring_buffer_write(&_audioBuffer, (uint8_t*)floatData, bufferSize);
-        free(floatData);
-    } else if (frame->format == kAudioFormatPlanarS16) {
-        // Convert planar S16 to interleaved float
-        int samples = frame->samples_per_channel;
-        int channels = frame->channels;
-        size_t bufferSize = samples * channels * sizeof(float);
-        float* interleaved = malloc(bufferSize);
-
-        for (int s = 0; s < samples; s++) {
-            for (int c = 0; c < channels && c < frame->plane_count; c++) {
-                const int16_t* plane = (const int16_t*)frame->planes[c];
-                interleaved[s * channels + c] = plane[s] / 32768.0f;
+            self.mediaGeneration = event->media_generation;
+            if (event->video_layer && !self.videoWindow) {
+                uint64_t generation = event->generation, media = event->media_generation;
+                __weak ReceiverViewController *weakSelf = self;
+                self.videoWindow = [[VideoWindowController alloc] initWithLayer:(__bridge CALayer *)event->video_layer
+                    title:self.sessionName onClose:^{
+                        ReceiverViewController *self = weakSelf;
+                        if (!self || self.generation != generation || self.mediaGeneration != media) return;
+                        ASCastStopReceiverMedia(self.runtime, generation, media);
+                        self.videoWindow = nil;
+                    }];
+                [self.videoWindow showWindow:nil];
             }
+            break;
         }
-
-        audio_ring_buffer_write(&_audioBuffer, (uint8_t*)interleaved, bufferSize);
-        free(interleaved);
+        case ASCastStopping:
+            self.status.stringValue = @"Stopping receiver…";
+            break;
+        case ASCastFailed:
+            self.lastError = [(__bridge NSString *)event->error copy] ?: @"Receiver failed.";
+            self.status.stringValue = self.lastError;
+            [self.videoWindow closeWithoutStopping];
+            self.videoWindow = nil;
+            if (!self.stopCompletions) [self stopWithCompletion:^{}];
+            break;
+        case ASCastStopped:
+            [self.videoWindow closeWithoutStopping];
+            self.videoWindow = nil;
+            if (!self.stopCompletions) [self stopWithCompletion:^{}];
+            break;
+        default: break;
     }
+    [self updateControls];
 }
-
-- (void)handleError:(int)errorCode message:(const char*)message {
-    NSString* msg = message ? [NSString stringWithUTF8String:message] : @"Unknown error";
-    [self updateStatus:[NSString stringWithFormat:@"Error: %@", msg]];
+- (void)stopWithCompletion:(dispatch_block_t)completion {
+    if (self.stopCompletions) {
+        [self.stopCompletions addObject:[completion copy]];
+        return;
+    }
+    self.stopCompletions = [NSMutableArray arrayWithObject:[completion copy]];
+    [self updateControls];
+    [self.videoWindow closeWithoutStopping];
+    self.videoWindow = nil;
+    ASCastStopReceiver(self.runtime, ASInvokeCompletion, ASCompletionContext(^{
+        self.generation = self.mediaGeneration = 0;
+        self.status.stringValue = self.lastError ?: @"Receiver stopped.";
+        NSArray<dispatch_block_t> *completions = [self.stopCompletions copy];
+        self.stopCompletions = nil;
+        [self updateControls];
+        for (dispatch_block_t done in completions) done();
+    }));
 }
-
-- (void)dealloc {
-    [self stopReceiver];
-    audio_ring_buffer_destroy(&_audioBuffer);
-}
-
 @end
-
-// C Callback Implementations
-static void on_window_open(void* user_data, const CastWindowConfig* config) {
-    ReceiverViewController* vc = (__bridge ReceiverViewController*)user_data;
-    [vc openVideoWindowWithWidth:config->width height:config->height title:config->title];
-}
-
-static void on_window_close(void* user_data) {
-    ReceiverViewController* vc = (__bridge ReceiverViewController*)user_data;
-    [vc closeVideoWindow];
-}
-
-static void on_window_resize(void* user_data, int width, int height) {
-    ReceiverViewController* vc = (__bridge ReceiverViewController*)user_data;
-    [vc resizeVideoWindowToWidth:width height:height];
-}
-
-static void on_video_frame(void* user_data, const CastVideoFrame* frame) {
-    ReceiverViewController* vc = (__bridge ReceiverViewController*)user_data;
-    [vc displayVideoFrame:frame];
-}
-
-static void on_audio_frame(void* user_data, const CastAudioFrame* frame) {
-    ReceiverViewController* vc = (__bridge ReceiverViewController*)user_data;
-    [vc handleAudioFrame:frame];
-}
-
-static void on_error(void* user_data, int error_code, const char* error_message) {
-    ReceiverViewController* vc = (__bridge ReceiverViewController*)user_data;
-    [vc handleError:error_code message:error_message];
+static void ReceiverEvent(void *context, const ASCastEvent *event) {
+    [(__bridge ReceiverViewController *)context receiveEvent:event];
 }

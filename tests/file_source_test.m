@@ -160,6 +160,7 @@ static void RunCase(NSUInteger index) {
                 if (error) fprintf(stderr, "%s\n", error.description.UTF8String);
                 REQUIRE(!error && descriptor.hasVideo == test.video && descriptor.hasAudio == test.audio);
                 if (test.video) REQUIRE(descriptor.width == (test.rotated ? 24 : 32) && descriptor.height == (test.rotated ? 32 : 24));
+                if (test.variable) REQUIRE(descriptor.framesPerSecond >= 60);
                 if (test.audio) REQUIRE(descriptor.audioChannels == 2 && descriptor.audioSampleRate == 48000);
                 __block NSUInteger videos = 0, audioFrames = 0, retries = 0;
                 __block CMTime firstAudio = kCMTimeInvalid, firstVideo = kCMTimeInvalid;

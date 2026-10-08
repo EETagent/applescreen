@@ -112,6 +112,14 @@ static CMTime FirstMediaTime(AVAssetTrack *track) {
         _descriptor.framesPerSecond = video.nominalFrameRate;
         if (!isfinite(_descriptor.framesPerSecond) || _descriptor.framesPerSecond < 0)
             return FileError(@"Invalid video frame rate.");
+        // Negotiation needs the peak source rate; an average VFR rate would
+        // unnecessarily discard closely spaced frames even on a 60 Hz receiver.
+        CMTime minimum = video.minFrameDuration;
+        if (CMTIME_IS_NUMERIC(minimum) && minimum.value > 0 && minimum.timescale > 0)
+            _descriptor.framesPerSecond = MAX(_descriptor.framesPerSecond,
+                (double)minimum.timescale / minimum.value);
+        if (_descriptor.framesPerSecond == 0) _descriptor.framesPerSecond = 60;
+        // This fallback is only an offer ceiling. Scheduling always uses PTS.
     }
     if (audio) {
         _audioStart = FirstMediaTime(audio);
