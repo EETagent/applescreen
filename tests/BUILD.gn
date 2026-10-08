@@ -1,0 +1,10 @@
+import("//gni/openscreen.gni")
+
+# A platform-independent core subset. This entry does not load the macOS app's
+# BUILD.gn, link AppKit/AVFoundation, or require its external codec libraries.
+openscreen_executable("media_timeline_test") {
+  testonly = true
+  sources = [ "media_timeline_test.cc", "../native/media/ReceiverTimeline.h" ]
+  cflags = [ "-UNDEBUG" ]
+  deps = [ "//cast/streaming:common" ]
+}
